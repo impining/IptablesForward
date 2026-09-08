@@ -1,5 +1,4 @@
 # nftablesRules
 
 使用
-
-bash <(curl -sL https://raw.githubusercontent.com/impining/nftablesRules/refs/heads/main/forward.sh)
+curl -sL https://raw.githubusercontent.com/impining/nftablesRules/refs/heads/main/forward.sh -o /tmp/forward.sh && bash /tmp/forward.sh && rm -f /tmp/forward.sh
