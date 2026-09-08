@@ -66,7 +66,7 @@ add_port_forward() {
 
     echo -e "${GREEN}[√] 转发规则添加完成！${RESET}"
 
-    # 自动触发测试
+    # 自动触发单条测试
     test_port_forward "$a" "$b" "$c"
 }
 
@@ -92,7 +92,7 @@ _exec_test() {
     fi
 }
 
-# 3. 测试转发连通性（支持自动读取已有的 iptables 规则）
+# 3. 测试转发连通性（全格式智能提取兼容版）
 test_port_forward() {
     local local_port=$1
     local target_ip=$2
@@ -102,32 +102,43 @@ test_port_forward() {
     if [[ -z "$local_port" || -z "$target_ip" || -z "$target_port" ]]; then
         echo -e "\n${YELLOW}=== 正在检测并测试当前已有的转发规则 ===${RESET}"
         
-        # 提取 DNAT 规则中的 本机端口、目标IP、目标端口
-        rules=$(iptables -t nat -L PREROUTING -n --line-numbers | grep "DNAT" | awk '{
+        # 兼容更多 iptables/nftables 输出格式的强力正则表达式解析
+        rules=$(iptables -t nat -L PREROUTING -n -v --line-numbers | grep -i "DNAT" | awk '{
             lport=""; tip=""; tport="";
-            for(i=1;i<=NF;i++){
-                if($i ~ /^dpt:/) { split($i, a, ":"); lport=a[2] }
-                if($i ~ /^to:/) { 
+            for(i=1; i<=NF; i++){
+                # 匹配 dpt:8080 或 dports 8080
+                if ($i ~ /^dpt:/) { split($i, a, ":"); lport=a[2] }
+                else if ($i == "dpt:" && $(i+1) ~ /^[0-9]+$/) { lport=$(i+1) }
+                
+                # 匹配 to:1.2.3.4:80 或 to-destination 1.2.3.4:80
+                if ($i ~ /^to:/) { 
                     split($i, b, ":"); 
                     tip=b[2]; 
                     tport=b[3] 
+                } else if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) {
+                    split($i, c, ":");
+                    tip=c[1];
+                    tport=c[2];
                 }
             }
-            if(lport != "" && tip != "" && tport != "") {
+            if (lport != "" && tip != "" && tport != "") {
                 print lport" "tip" "tport
             }
         }' | sort -u)
 
         if [ -z "$rules" ]; then
-            echo -e "${YELLOW}[!] 未在 iptables 中检测到已有的 DNAT 转发规则。${RESET}"
-            read -p "请手动输入要测试的 本机端口 (a): " local_port
-            read -p "请手动输入要测试的 目标 IP (b): " target_ip
-            read -p "请手动输入要测试的 目标端口 (c): " target_port
+            echo -e "${RED}[!] 未能在 iptables 中自动抓取到标准的 DNAT 规则。${RESET}"
+            echo -e "${YELLOW}（请确认你是否已通过选项 2 添加过规则，或当前规则未包含在 PREROUTING 链中）${RESET}\n"
+            read -p "按回车键返回手动测试，或直接按 Enter 重新输入参数: " _dummy
+            read -p "请输入要测试的 本机端口 (a): " local_port
+            read -p "请输入要测试的 目标 IP (b): " target_ip
+            read -p "请输入要测试的 目标端口 (c): " target_port
             
             echo -ne "本机端口 ${CYAN}$local_port${RESET} -> 目标 ${CYAN}$target_ip:$target_port${RESET} | 测试结果: "
             _exec_test "$local_port" "$target_ip" "$target_port"
             return
         else
+            # 找到规则后循环测试
             echo "$rules" | while read -r l_port t_ip t_port; do
                 echo -ne "本机端口 ${CYAN}$l_port${RESET} -> 目标 ${CYAN}$t_ip:$t_port${RESET} | 测试结果: "
                 _exec_test "$l_port" "$t_ip" "$t_port"
@@ -161,7 +172,6 @@ clear_rules() {
 # 退出并清理脚本自身临时文件
 exit_script() {
     echo -e "${GREEN}感谢使用，已退出脚本。${RESET}"
-    # 如果脚本是在 /tmp 下执行的临时文件，则自动清理
     if [[ "$0" == "/tmp/"* ]]; then
         rm -f "$0"
     fi
@@ -176,7 +186,7 @@ main_menu() {
         echo -e "${GREEN}========================================${RESET}"
         echo -e " 1. 开启 IP 流量转发检查"
         echo -e " 2. 添加端口转发规则 (a端口 -> bIP:c端口)"
-        echo -e " 3. 测试端口转发连通性 (支持自动检测)"
+        echo -e " 3. 测试端口转发连通性 (自动检测规则)"
         echo -e " 4. 查看当前转发规则"
         echo -e " 5. 清空所有 NAT 规则"
         echo -e " 0. 退出脚本"
