@@ -2,6 +2,7 @@
 #
 # Linux 端口转发工具（nft / iptables 后端自动适配）
 # 适配环境: table ip nat + table ip filter (FORWARD 链, 大写)
+# 修复: nft 规则解析（兼容 counter 插入）、测试改为映射展示
 #
 
 GREEN='\033[32m'
@@ -70,6 +71,7 @@ validate_ipv4() {
     [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
     local IFS='.'
     local -a o=($1)
+    local x
     for x in "${o[@]}"; do
         [ "$x" -ge 0 ] && [ "$x" -le 255 ] || return 1
     done
@@ -136,7 +138,7 @@ add_port_forward() {
         nft list chain $NFT_TABLE postrouting &>/dev/null || \
             nft add chain $NFT_TABLE postrouting '{ type nat hook postrouting priority srcnat; }'
 
-        local pre existing_nat
+        local existing_nat
         existing_nat=$(nft list table $NFT_TABLE 2>/dev/null)
 
         # DNAT 去重
@@ -168,19 +170,16 @@ add_port_forward() {
 
     else
         # ---- iptables-legacy ----
-        # MASQUERADE 去重
         iptables -t nat -C POSTROUTING -d "$b" -p tcp --dport "$c" -j MASQUERADE 2>/dev/null || \
             iptables -t nat -A POSTROUTING -d "$b" -p tcp --dport "$c" -j MASQUERADE
         iptables -t nat -C POSTROUTING -d "$b" -p udp --dport "$c" -j MASQUERADE 2>/dev/null || \
             iptables -t nat -A POSTROUTING -d "$b" -p udp --dport "$c" -j MASQUERADE
 
-        # DNAT 去重
         iptables -t nat -C PREROUTING -p tcp --dport "$a" -j DNAT --to-destination "$b:$c" 2>/dev/null || \
             iptables -t nat -A PREROUTING -p tcp --dport "$a" -j DNAT --to-destination "$b:$c"
         iptables -t nat -C PREROUTING -p udp --dport "$a" -j DNAT --to-destination "$b:$c" 2>/dev/null || \
             iptables -t nat -A PREROUTING -p udp --dport "$a" -j DNAT --to-destination "$b:$c"
 
-        # FORWARD 去重
         iptables -C FORWARD -p tcp -d "$b" --dport "$c" -j ACCEPT 2>/dev/null || \
             iptables -A FORWARD -p tcp -d "$b" --dport "$c" -j ACCEPT
         iptables -C FORWARD -p udp -d "$b" --dport "$c" -j ACCEPT 2>/dev/null || \
@@ -190,44 +189,19 @@ add_port_forward() {
     fi
 
     echo -e "${GREEN}[√] 添加完成。${RESET}"
-    test_port_forward "$a" "$b" "$c"
+    echo -e "${YELLOW}[i] 验证请从另一台机器访问 本机IP:$a${RESET}"
 }
 
-# ================= 连通性测试 =================
-_exec_test() {
-    local t_ip=$1
-    local t_port=$2
-    local res
-    if command -v nc &>/dev/null; then
-        nc -z -w 3 "$t_ip" "$t_port" &>/dev/null
-        res=$?
-    else
-        timeout 3 bash -c "</dev/tcp/$t_ip/$t_port" &>/dev/null
-        res=$?
-    fi
-    if [ $res -eq 0 ]; then echo -e "${GREEN}通${RESET}"; else echo -e "${RED}不通${RESET}"; fi
-}
-
-test_port_forward() {
-    local l_port=$1
-    local t_ip=$2
-    local t_port=$3
-
-    # 添加后直接调用的单条测试（测的是本机到目标的可达性）
-    if [[ -n "$l_port" && -n "$t_ip" && -n "$t_port" ]]; then
-        echo -ne "入口 ${CYAN}$l_port${RESET} -> 目标 ${CYAN}$t_ip:$t_port${RESET} | 目标可达性: "
-        _exec_test "$t_ip" "$t_port"
-        echo -e "${YELLOW}[i] 这只是本机到目标端口的可达性，不代表 DNAT 生效。${RESET}"
-        echo -e "${YELLOW}    验证 DNAT 请从另一台机器访问 本机IP:$l_port。${RESET}"
-        return
-    fi
-
-    echo -e "\n${YELLOW}=== 抓取已有 DNAT 规则 ===${RESET}"
+# ================= 抓取并展示 DNAT 映射 =================
+show_dnat_mapping() {
+    echo -e "\n${YELLOW}=== 当前 DNAT 映射 ===${RESET}"
     local rules=""
+
     if [ "$BACKEND" = "nft" ]; then
+        # 兼容规则中间插入 counter packets/bytes 的写法
         rules=$(nft list table $NFT_TABLE 2>/dev/null | \
             grep -E 'dnat to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | \
-            sed -E 's/.*(tcp|udp) dport ([0-9]+) dnat to ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+).*/\2 \3 \4/' | \
+            sed -E 's/.*(tcp|udp) dport ([0-9]+).*dnat to ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+).*/\2 \3 \4/' | \
             sort -u)
     else
         rules=$(iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | \
@@ -247,25 +221,27 @@ test_port_forward() {
 
     if [ -z "$rules" ]; then
         echo -e "${RED}[!] 未抓到 DNAT 规则。${RESET}"
-        read -p "本机端口 (a): " l_port
-        read -p "目标 IP (b): " t_ip
-        read -p "目标端口 (c): " t_port
-        if [[ -n "$l_port" && -n "$t_ip" && -n "$t_port" ]]; then
-            echo -ne "入口 ${CYAN}$l_port${RESET} -> ${CYAN}$t_ip:$t_port${RESET} | 可达性: "
-            _exec_test "$t_ip" "$t_port"
-        fi
+        echo -e "${YELLOW}（可能尚未添加转发，或规则不在 nat 表 PREROUTING 链中）${RESET}"
         return
     fi
 
+    # 合并 TCP/UDP 重复端口，展示为唯一映射
+    local seen=""
     echo "$rules" | while read -r lp tip tp; do
-        echo -ne "入口 ${CYAN}$lp${RESET} -> ${CYAN}$tip:$tp${RESET} | 目标可达性: "
-        _exec_test "$tip" "$tp"
+        local key="${lp}-${tip}-${tp}"
+        if echo "$seen" | grep -q "$key"; then
+            continue
+        fi
+        seen="$seen $key"
+        echo -e "入口 ${CYAN}$lp${RESET} -> 目标 ${CYAN}$tip:$tp${RESET}"
     done
-    echo -e "${YELLOW}[i] 以上为目标端口可达性，不是 DNAT 链路本身。${RESET}"
-    echo -e "${YELLOW}    请从另一台机器访问 本机IP:<入口端口> 验证。${RESET}"
+
+    echo -e "\n${YELLOW}[i] 验证方法（从另一台机器执行）：${RESET}"
+    echo -e "    nc -zv <本机IP> <入口端口>"
+    echo -e "${YELLOW}[i] 注意：本机自己测 DNAT 有局限（走 OUTPUT 链，不经过 PREROUTING）。${RESET}"
 }
 
-# ================= 查看 =================
+# ================= 查看规则 =================
 list_rules() {
     echo -e "\n${YELLOW}=== 当前 NAT 转发规则 ===${RESET}"
     if [ "$BACKEND" = "nft" ]; then
@@ -311,7 +287,7 @@ main_menu() {
         echo -e "${GREEN}========================================${RESET}"
         echo -e " 1. 检查/开启 IP 转发"
         echo -e " 2. 添加端口转发规则 (a -> b:c)"
-        echo -e " 3. 测试已有转发规则"
+        echo -e " 3. 查看 DNAT 映射（含验证提示）"
         echo -e " 4. 查看当前 NAT / FORWARD 规则"
         echo -e " 5. 清空 NAT 规则"
         echo -e " 0. 退出"
@@ -320,7 +296,7 @@ main_menu() {
         case "$choice" in
             1) check_and_enable_ip_forward ;;
             2) add_port_forward ;;
-            3) test_port_forward ;;
+            3) show_dnat_mapping ;;
             4) list_rules ;;
             5) clear_rules ;;
             0) exit_script ;;
