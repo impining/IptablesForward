@@ -314,17 +314,23 @@ list_rules() {
 
 # ================= 清理 =================
 clear_rules() {
-    echo -e "\n${RED}[!] 警告：即将清空 NAT 表规则！${RESET}"
-    echo -e "${YELLOW}[i] 如果服务器上运行了 Docker 或其他网络服务，清空 NAT 表可能会导致其端口映射失效。${RESET}"
+    echo -e "\n${RED}[!] 警告：即将清空 NAT 规则以及 FORWARD 放行规则！${RESET}"
     read -p "确认清空？(y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { echo "已取消操作。"; return; }
 
     if [ "$BACKEND" = "nft" ]; then
+        # 清空 nat 表
         nft flush table $NFT_TABLE 2>/dev/null && echo -e "${GREEN}[√] nft 表 $NFT_TABLE 已清空。${RESET}"
+        
+        # 清理 filter 表的 FORWARD 链（将其恢复为默认 policy accept 且无多余规则）
+        if nft list table ip filter &>/dev/null; then
+            nft flush chain ip filter FORWARD 2>/dev/null
+            echo -e "${GREEN}[√] nft 表 ip filter 的 FORWARD 链已清空。${RESET}"
+        fi
     else
         iptables -t nat -F && echo -e "${GREEN}[√] iptables nat 表已清空。${RESET}"
+        iptables -F FORWARD && echo -e "${GREEN}[√] iptables FORWARD 链已清空。${RESET}"
     fi
-    echo -e "${YELLOW}[i] FORWARD 链规则未动。${RESET}"
 }
 
 # ================= 退出 =================
