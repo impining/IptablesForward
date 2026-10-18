@@ -1,8 +1,7 @@
 #!/bin/bash
 #
 # Linux 端口转发工具（nft / iptables 后端自动适配）
-# 适配环境: table ip nat + table ip filter (FORWARD 链, 大写)
-# 修复: 去重子shell失效、IPv4校验、正则转义、误导性测试、清理警告
+# 测试口径: 本机 -> 目标IP:目标端口 直连可达性
 #
 
 GREEN='\033[32m'
@@ -67,7 +66,6 @@ validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
-# 修复: 先整体正则匹配，再校验段数，再逐段校验纯数字和范围
 validate_ipv4() {
     local ip=$1
     [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
@@ -82,7 +80,6 @@ validate_ipv4() {
     return 0
 }
 
-# 修复: 转义 IP 中的点，供 grep -E 使用
 escape_dots() {
     echo "$1" | sed 's/\./\\./g'
 }
@@ -110,7 +107,6 @@ ensure_nft_forward_accept() {
         nft add rule ip filter "$fchain" ip daddr "$tip" udp dport "$tport" counter accept
         echo -e "${GREEN}  + FORWARD 放行 UDP $tip:$tport${RESET}"
     fi
-    # 回程兼容 { established, related } 和 established,related
     if ! echo "$existing" | grep -qE "ct state .*(established|related)"; then
         nft add rule ip filter "$fchain" ct state established,related accept
         echo -e "${GREEN}  + FORWARD 回程放行 (established,related)${RESET}"
@@ -193,12 +189,41 @@ add_port_forward() {
     fi
 
     echo -e "${GREEN}[√] 添加完成。${RESET}"
-    echo -e "${YELLOW}[i] 验证请从另一台机器访问 本机IP:$a（本机自测有局限，见选项 3）${RESET}"
+
+    # 添加后直接测目标端口可达性
+    echo -ne "目标 ${CYAN}$b:$c${RESET} 可达性: "
+    exec_test "$b" "$c"
 }
 
-# ================= 抓取 DNAT 映射（返回纯文本，供展示和测试复用） =================
-gather_dnat_mapping() {
+# ================= 连通性测试（本机 -> 目标IP:端口） =================
+exec_test() {
+    local t_ip=$1
+    local t_port=$2
+    local res
+
+    if command -v nc &>/dev/null; then
+        nc -z -w 3 "$t_ip" "$t_port" &>/dev/null
+        res=$?
+    elif command -v timeout &>/dev/null; then
+        timeout 3 bash -c "</dev/tcp/$t_ip/$t_port" &>/dev/null
+        res=$?
+    else
+        bash -c "</dev/tcp/$t_ip/$t_port" &>/dev/null
+        res=$?
+    fi
+
+    if [ $res -eq 0 ]; then
+        echo -e "${GREEN}通${RESET}"
+    else
+        echo -e "${RED}不通${RESET}"
+    fi
+}
+
+# ================= 抓取并测试已有 DNAT 映射 =================
+test_port_forward() {
+    echo -e "\n${YELLOW}=== 抓取已有 DNAT 规则并测试目标可达性 ===${RESET}"
     local rules=""
+
     if [ "$BACKEND" = "nft" ]; then
         rules=$(nft list table $NFT_TABLE 2>/dev/null | \
             grep -E 'dnat to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | \
@@ -219,27 +244,21 @@ gather_dnat_mapping() {
                 if (lport != "" && tip != "" && tport != "") print lport" "tip" "tport
             }' | sort -u)
     fi
-    echo "$rules"
-}
-
-# ================= 获取本机出口/内网 IP（用于提示测试地址） =================
-get_local_ip() {
-    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
-}
-
-# ================= 展示映射 + 正确测试方法 =================
-show_dnat_mapping() {
-    echo -e "\n${YELLOW}=== 当前 DNAT 映射 ===${RESET}"
-    local rules
-    rules=$(gather_dnat_mapping)
 
     if [ -z "$rules" ]; then
         echo -e "${RED}[!] 未抓到 DNAT 规则。${RESET}"
-        echo -e "${YELLOW}（可能尚未添加转发，或规则不在 nat 表 PREROUTING 链中）${RESET}"
+        read -p "手动输入 目标 IP: " m_ip
+        read -p "手动输入 目标端口: " m_port
+        if validate_ipv4 "$m_ip" && validate_port "$m_port"; then
+            echo -ne "目标 ${CYAN}$m_ip:$m_port${RESET} 可达性: "
+            exec_test "$m_ip" "$m_port"
+        else
+            echo -e "${RED}[!] 输入非法。${RESET}"
+        fi
         return
     fi
 
-    # 修复: 进程替换让 while 在父 shell 运行，去重生效
+    # 去重（进程替换，父 shell 生效）
     local seen="" unique=""
     while read -r lp tip tp; do
         local key="${lp}-${tip}-${tp}"
@@ -250,31 +269,11 @@ show_dnat_mapping() {
         unique="${unique}${lp} ${tip} ${tp}"$'\n'
     done < <(echo "$rules")
 
-    echo -e "${GREEN}入口端口 -> 目标地址${RESET}"
     while read -r lp tip tp; do
         [ -z "$lp" ] && continue
-        echo -e "  ${CYAN}$lp${RESET} -> ${CYAN}$tip:$tp${RESET}"
+        echo -ne "入口 ${CYAN}$lp${RESET} -> 目标 ${CYAN}$tip:$tp${RESET} | 目标可达性: "
+        exec_test "$tip" "$tp"
     done < <(echo "$unique")
-
-    local lip
-    lip=$(get_local_ip)
-    [ -z "$lip" ] && lip="<本机IP>"
-
-    echo -e "\n${YELLOW}[i] 正确的验证方法：${RESET}"
-    echo -e "  ${GREEN}方法 A（推荐，真正验证转发）${RESET}"
-    echo -e "    从另一台机器执行： nc -zv $lip <入口端口>"
-    echo -e "    例如入口 12492：  nc -zv $lip 12492"
-    echo -e "    通了说明 DNAT 转发链路正常。"
-    echo -e ""
-    echo -e "  ${GREEN}方法 B（本机自测，有局限）${RESET}"
-    echo -e "    nc -zv 127.0.0.1 <入口端口>"
-    echo -e "    ${RED}注意：本机访问本机 IP/回环时，包走 OUTPUT 链，不经过 PREROUTING，${RESET}"
-    echo -e "    ${RED}DNAT 不会对这类包生效，所以“本机自测不通”不代表转发坏了。${RESET}"
-    echo -e "    ${RED}它只能证明本机入口端口上有没有进程/规则响应。${RESET}"
-    echo -e ""
-    echo -e "  ${GREEN}方法 C（看计数）${RESET}"
-    echo -e "    nft list table $NFT_TABLE   # 看 postrouting masquerade 的 counter 是否增长"
-    echo -e "    ${YELLOW}有外部流量经过时 counter 增长，即证明转发在工作。${RESET}"
 }
 
 # ================= 查看规则 =================
@@ -297,9 +296,7 @@ list_rules() {
 
 # ================= 清理 =================
 clear_rules() {
-    echo -e "\n${RED}[!] 即将清空 NAT 表规则。${RESET}"
-    echo -e "${RED}    注意：会删除该表中【所有】规则，包括非本脚本添加的。${RESET}"
-    echo -e "${YELLOW}    不含 FORWARD 链。${RESET}"
+    echo -e "\n${RED}[!] 即将清空 NAT 表规则（会删除该表所有规则，含非本脚本添加的，不含 FORWARD）。${RESET}"
     read -p "确认？(y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
@@ -325,7 +322,7 @@ main_menu() {
         echo -e "${GREEN}========================================${RESET}"
         echo -e " 1. 检查/开启 IP 转发"
         echo -e " 2. 添加端口转发规则 (a -> b:c)"
-        echo -e " 3. 查看 DNAT 映射 + 正确验证方法"
+        echo -e " 3. 测试已有转发（本机 -> 目标端口）"
         echo -e " 4. 查看当前 NAT / FORWARD 规则"
         echo -e " 5. 清空 NAT 规则"
         echo -e " 0. 退出"
@@ -334,7 +331,7 @@ main_menu() {
         case "$choice" in
             1) check_and_enable_ip_forward ;;
             2) add_port_forward ;;
-            3) show_dnat_mapping ;;
+            3) test_port_forward ;;
             4) list_rules ;;
             5) clear_rules ;;
             0) exit_script ;;
