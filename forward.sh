@@ -140,10 +140,16 @@ add_port_forward() {
 
     if [ "$BACKEND" = "nft" ]; then
         nft list table $NFT_TABLE &>/dev/null || nft add table $NFT_TABLE
-        nft list chain $NFT_TABLE prerouting &>/dev/null || \
-            nft add chain $NFT_TABLE prerouting '{ type nat hook prerouting priority dstnat; }'
-        nft list chain $NFT_TABLE postrouting &>/dev/null || \
-            nft add chain $NFT_TABLE postrouting '{ type nat hook postrouting priority srcnat; }'
+        
+        # 检查并创建标准的 PREROUTING 链
+        if ! nft list chain $NFT_TABLE PREROUTING &>/dev/null; then
+            nft add chain $NFT_TABLE PREROUTING '{ type nat hook prerouting priority dstnat; policy accept; }'
+        fi
+        
+        # 检查并创建标准的 POSTROUTING 链
+        if ! nft list chain $NFT_TABLE POSTROUTING &>/dev/null; then
+            nft add chain $NFT_TABLE POSTROUTING '{ type nat hook postrouting priority srcnat; policy accept; }'
+        fi
 
         local existing_nat b_esc
         existing_nat=$(nft list table $NFT_TABLE 2>/dev/null)
