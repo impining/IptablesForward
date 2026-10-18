@@ -253,7 +253,7 @@ test_port_forward() {
     if [ -z "$rules" ]; then
         echo -e "${RED}[!] 未抓到自动生成的 DNAT 规则。${RESET}"
         read -p "是否手动输入目标 IP:端口 进行测试？(y/N): " manual_choice
-        if [[ "$manual_choice" == "y" \vert{}\vert{} "$manual_choice" == "Y" ]]; then
+        if [[ "$manual_choice" == "y" || "$manual_choice" == "Y" ]]; then
             read -p "手动输入 目标 IP: " m_ip
             read -p "手动输入 目标端口: " m_port
             if validate_ipv4 "$m_ip" && validate_port "$m_port"; then
