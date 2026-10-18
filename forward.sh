@@ -2,7 +2,7 @@
 #
 # Linux 端口转发工具（nft / iptables 后端自动适配）
 # 适配环境: table ip nat + table ip filter (FORWARD 链, 大写)
-# 修复: nft 规则解析（兼容 counter 插入）、测试改为映射展示
+# 修复: 去重子shell失效、IPv4校验、正则转义、误导性测试、清理警告
 #
 
 GREEN='\033[32m'
@@ -67,15 +67,24 @@ validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+# 修复: 先整体正则匹配，再校验段数，再逐段校验纯数字和范围
 validate_ipv4() {
-    [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    local ip=$1
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
     local IFS='.'
-    local -a o=($1)
+    local -a o=($ip)
+    [ "${#o[@]}" -eq 4 ] || return 1
     local x
     for x in "${o[@]}"; do
+        [[ "$x" =~ ^[0-9]+$ ]] || return 1
         [ "$x" -ge 0 ] && [ "$x" -le 255 ] || return 1
     done
     return 0
+}
+
+# 修复: 转义 IP 中的点，供 grep -E 使用
+escape_dots() {
+    echo "$1" | sed 's/\./\\./g'
 }
 
 # ================= nft: FORWARD 放行 =================
@@ -83,7 +92,8 @@ ensure_nft_forward_accept() {
     local tip=$1
     local tport=$2
     local fchain="FORWARD"
-    local existing
+    local existing tip_esc
+    tip_esc=$(escape_dots "$tip")
 
     nft list table ip filter &>/dev/null || nft add table ip filter
     if ! nft list chain ip filter "$fchain" &>/dev/null; then
@@ -92,17 +102,15 @@ ensure_nft_forward_accept() {
 
     existing=$(nft list chain ip filter "$fchain" 2>/dev/null)
 
-    # 去程：只要出现 "ip daddr <ip> tcp/udp dport <port>" 即视为已存在（兼容 counter 写法）
-    if ! echo "$existing" | grep -qE "ip daddr $tip tcp dport $tport\b"; then
+    if ! echo "$existing" | grep -qE "ip daddr $tip_esc tcp dport $tport\b"; then
         nft add rule ip filter "$fchain" ip daddr "$tip" tcp dport "$tport" counter accept
         echo -e "${GREEN}  + FORWARD 放行 TCP $tip:$tport${RESET}"
     fi
-    if ! echo "$existing" | grep -qE "ip daddr $tip udp dport $tport\b"; then
+    if ! echo "$existing" | grep -qE "ip daddr $tip_esc udp dport $tport\b"; then
         nft add rule ip filter "$fchain" ip daddr "$tip" udp dport "$tport" counter accept
         echo -e "${GREEN}  + FORWARD 放行 UDP $tip:$tport${RESET}"
     fi
-
-    # 回程：兼容 { established, related } 和 established,related 两种写法
+    # 回程兼容 { established, related } 和 established,related
     if ! echo "$existing" | grep -qE "ct state .*(established|related)"; then
         nft add rule ip filter "$fchain" ct state established,related accept
         echo -e "${GREEN}  + FORWARD 回程放行 (established,related)${RESET}"
@@ -131,45 +139,41 @@ add_port_forward() {
     echo -e "\n添加规则: 本机:$a -> $b:$c ..."
 
     if [ "$BACKEND" = "nft" ]; then
-        # ---- 确保 nat 表/链 ----
         nft list table $NFT_TABLE &>/dev/null || nft add table $NFT_TABLE
         nft list chain $NFT_TABLE prerouting &>/dev/null || \
             nft add chain $NFT_TABLE prerouting '{ type nat hook prerouting priority dstnat; }'
         nft list chain $NFT_TABLE postrouting &>/dev/null || \
             nft add chain $NFT_TABLE postrouting '{ type nat hook postrouting priority srcnat; }'
 
-        local existing_nat
+        local existing_nat b_esc
         existing_nat=$(nft list table $NFT_TABLE 2>/dev/null)
+        b_esc=$(escape_dots "$b")
 
-        # DNAT 去重
-        if ! echo "$existing_nat" | grep -qE "tcp dport $a\b.*dnat to $b:$c\b"; then
+        if ! echo "$existing_nat" | grep -qE "tcp dport $a\b.*dnat to $b_esc:$c\b"; then
             nft add rule $NFT_TABLE prerouting tcp dport "$a" dnat to "$b:$c"
             echo -e "${GREEN}  + DNAT TCP :$a -> $b:$c${RESET}"
         else
             echo -e "${YELLOW}  = DNAT TCP :$a -> $b:$c 已存在，跳过${RESET}"
         fi
-        if ! echo "$existing_nat" | grep -qE "udp dport $a\b.*dnat to $b:$c\b"; then
+        if ! echo "$existing_nat" | grep -qE "udp dport $a\b.*dnat to $b_esc:$c\b"; then
             nft add rule $NFT_TABLE prerouting udp dport "$a" dnat to "$b:$c"
             echo -e "${GREEN}  + DNAT UDP :$a -> $b:$c${RESET}"
         else
             echo -e "${YELLOW}  = DNAT UDP :$a -> $b:$c 已存在，跳过${RESET}"
         fi
 
-        # MASQUERADE 去重（带目标条件，不搞全量）
-        if ! echo "$existing_nat" | grep -qE "ip daddr $b tcp dport $c\b.*masquerade"; then
+        if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc tcp dport $c\b.*masquerade"; then
             nft add rule $NFT_TABLE postrouting ip daddr "$b" tcp dport "$c" masquerade
             echo -e "${GREEN}  + MASQ TCP $b:$c${RESET}"
         fi
-        if ! echo "$existing_nat" | grep -qE "ip daddr $b udp dport $c\b.*masquerade"; then
+        if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc udp dport $c\b.*masquerade"; then
             nft add rule $NFT_TABLE postrouting ip daddr "$b" udp dport "$c" masquerade
             echo -e "${GREEN}  + MASQ UDP $b:$c${RESET}"
         fi
 
-        # FORWARD 放行
         ensure_nft_forward_accept "$b" "$c"
 
     else
-        # ---- iptables-legacy ----
         iptables -t nat -C POSTROUTING -d "$b" -p tcp --dport "$c" -j MASQUERADE 2>/dev/null || \
             iptables -t nat -A POSTROUTING -d "$b" -p tcp --dport "$c" -j MASQUERADE
         iptables -t nat -C POSTROUTING -d "$b" -p udp --dport "$c" -j MASQUERADE 2>/dev/null || \
@@ -189,16 +193,13 @@ add_port_forward() {
     fi
 
     echo -e "${GREEN}[√] 添加完成。${RESET}"
-    echo -e "${YELLOW}[i] 验证请从另一台机器访问 本机IP:$a${RESET}"
+    echo -e "${YELLOW}[i] 验证请从另一台机器访问 本机IP:$a（本机自测有局限，见选项 3）${RESET}"
 }
 
-# ================= 抓取并展示 DNAT 映射 =================
-show_dnat_mapping() {
-    echo -e "\n${YELLOW}=== 当前 DNAT 映射 ===${RESET}"
+# ================= 抓取 DNAT 映射（返回纯文本，供展示和测试复用） =================
+gather_dnat_mapping() {
     local rules=""
-
     if [ "$BACKEND" = "nft" ]; then
-        # 兼容规则中间插入 counter packets/bytes 的写法
         rules=$(nft list table $NFT_TABLE 2>/dev/null | \
             grep -E 'dnat to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | \
             sed -E 's/.*(tcp|udp) dport ([0-9]+).*dnat to ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+).*/\2 \3 \4/' | \
@@ -218,6 +219,19 @@ show_dnat_mapping() {
                 if (lport != "" && tip != "" && tport != "") print lport" "tip" "tport
             }' | sort -u)
     fi
+    echo "$rules"
+}
+
+# ================= 获取本机出口/内网 IP（用于提示测试地址） =================
+get_local_ip() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+# ================= 展示映射 + 正确测试方法 =================
+show_dnat_mapping() {
+    echo -e "\n${YELLOW}=== 当前 DNAT 映射 ===${RESET}"
+    local rules
+    rules=$(gather_dnat_mapping)
 
     if [ -z "$rules" ]; then
         echo -e "${RED}[!] 未抓到 DNAT 规则。${RESET}"
@@ -225,20 +239,42 @@ show_dnat_mapping() {
         return
     fi
 
-    # 合并 TCP/UDP 重复端口，展示为唯一映射
-    local seen=""
-    echo "$rules" | while read -r lp tip tp; do
+    # 修复: 进程替换让 while 在父 shell 运行，去重生效
+    local seen="" unique=""
+    while read -r lp tip tp; do
         local key="${lp}-${tip}-${tp}"
-        if echo "$seen" | grep -q "$key"; then
+        if echo " $seen " | grep -qF " $key "; then
             continue
         fi
         seen="$seen $key"
-        echo -e "入口 ${CYAN}$lp${RESET} -> 目标 ${CYAN}$tip:$tp${RESET}"
-    done
+        unique="${unique}${lp} ${tip} ${tp}"$'\n'
+    done < <(echo "$rules")
 
-    echo -e "\n${YELLOW}[i] 验证方法（从另一台机器执行）：${RESET}"
-    echo -e "    nc -zv <本机IP> <入口端口>"
-    echo -e "${YELLOW}[i] 注意：本机自己测 DNAT 有局限（走 OUTPUT 链，不经过 PREROUTING）。${RESET}"
+    echo -e "${GREEN}入口端口 -> 目标地址${RESET}"
+    while read -r lp tip tp; do
+        [ -z "$lp" ] && continue
+        echo -e "  ${CYAN}$lp${RESET} -> ${CYAN}$tip:$tp${RESET}"
+    done < <(echo "$unique")
+
+    local lip
+    lip=$(get_local_ip)
+    [ -z "$lip" ] && lip="<本机IP>"
+
+    echo -e "\n${YELLOW}[i] 正确的验证方法：${RESET}"
+    echo -e "  ${GREEN}方法 A（推荐，真正验证转发）${RESET}"
+    echo -e "    从另一台机器执行： nc -zv $lip <入口端口>"
+    echo -e "    例如入口 12492：  nc -zv $lip 12492"
+    echo -e "    通了说明 DNAT 转发链路正常。"
+    echo -e ""
+    echo -e "  ${GREEN}方法 B（本机自测，有局限）${RESET}"
+    echo -e "    nc -zv 127.0.0.1 <入口端口>"
+    echo -e "    ${RED}注意：本机访问本机 IP/回环时，包走 OUTPUT 链，不经过 PREROUTING，${RESET}"
+    echo -e "    ${RED}DNAT 不会对这类包生效，所以“本机自测不通”不代表转发坏了。${RESET}"
+    echo -e "    ${RED}它只能证明本机入口端口上有没有进程/规则响应。${RESET}"
+    echo -e ""
+    echo -e "  ${GREEN}方法 C（看计数）${RESET}"
+    echo -e "    nft list table $NFT_TABLE   # 看 postrouting masquerade 的 counter 是否增长"
+    echo -e "    ${YELLOW}有外部流量经过时 counter 增长，即证明转发在工作。${RESET}"
 }
 
 # ================= 查看规则 =================
@@ -261,7 +297,9 @@ list_rules() {
 
 # ================= 清理 =================
 clear_rules() {
-    echo -e "\n${RED}[!] 即将清空 NAT 表规则（不含 FORWARD）。${RESET}"
+    echo -e "\n${RED}[!] 即将清空 NAT 表规则。${RESET}"
+    echo -e "${RED}    注意：会删除该表中【所有】规则，包括非本脚本添加的。${RESET}"
+    echo -e "${YELLOW}    不含 FORWARD 链。${RESET}"
     read -p "确认？(y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
 
@@ -287,7 +325,7 @@ main_menu() {
         echo -e "${GREEN}========================================${RESET}"
         echo -e " 1. 检查/开启 IP 转发"
         echo -e " 2. 添加端口转发规则 (a -> b:c)"
-        echo -e " 3. 查看 DNAT 映射（含验证提示）"
+        echo -e " 3. 查看 DNAT 映射 + 正确验证方法"
         echo -e " 4. 查看当前 NAT / FORWARD 规则"
         echo -e " 5. 清空 NAT 规则"
         echo -e " 0. 退出"
