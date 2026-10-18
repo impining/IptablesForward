@@ -3,12 +3,6 @@
 ## Linux 端口转发工具（nft / iptables 后端自动适配）
 # 测试口径: 本机 -> 目标IP:目标端口 直连可达性
 
-#GREEN='\033[32m'
-#RED='\033[31m'
-#YELLOW='\033[33m'
-#CYAN='\033[36m'
-#RESET='\033[0m'
-
 GREEN='\033[32m'
 RED='\033[31m'
 YELLOW='\033[33m'
@@ -155,27 +149,27 @@ add_port_forward() {
         existing_nat=$(nft list table $NFT_TABLE 2>/dev/null)
         b_esc=$(escape_dots "$b")
 
-        if ! echo "$existing_nat" | grep -qE "tcp dport $a\b.*dnat ip to $b_esc:$c\b"; then
-            nft add rule $NFT_TABLE prerouting tcp dport "$a" dnat ip to "$b:$c"
+        if ! echo "$existing_nat" | grep -qE "tcp dport $a\b.*dnat (ip )?to $b_esc:$c\b"; then
+            nft add rule $NFT_TABLE PREROUTING tcp dport "$a" dnat ip to "$b:$c"
             echo -e "${GREEN}  + DNAT TCP :$a -> $b:$c${RESET}"
         else
             echo -e "${YELLOW}  = DNAT TCP :$a -> $b:$c 已存在，跳过${RESET}"
         fi
 
-        if ! echo "$existing_nat" | grep -qE "udp dport $a\b.*dnat ip to $b_esc:$c\b"; then
-            nft add rule $NFT_TABLE prerouting udp dport "$a" dnat ip to "$b:$c"
+        if ! echo "$existing_nat" | grep -qE "udp dport $a\b.*dnat (ip )?to $b_esc:$c\b"; then
+            nft add rule $NFT_TABLE PREROUTING udp dport "$a" dnat ip to "$b:$c"
             echo -e "${GREEN}  + DNAT UDP :$a -> $b:$c${RESET}"
         else
             echo -e "${YELLOW}  = DNAT UDP :$a -> $b:$c 已存在，跳过${RESET}"
         fi
 
         if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc tcp dport $c\b.*masquerade"; then
-            nft add rule $NFT_TABLE postrouting ip daddr "$b" tcp dport "$c" masquerade
+            nft add rule $NFT_TABLE POSTROUTING ip daddr "$b" tcp dport "$c" masquerade
             echo -e "${GREEN}  + MASQ TCP $b:$c${RESET}"
         fi
 
         if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc udp dport $c\b.*masquerade"; then
-            nft add rule $NFT_TABLE postrouting ip daddr "$b" udp dport "$c" masquerade
+            nft add rule $NFT_TABLE POSTROUTING ip daddr "$b" udp dport "$c" masquerade
             echo -e "${GREEN}  + MASQ UDP $b:$c${RESET}"
         fi
 
@@ -234,7 +228,6 @@ test_port_forward() {
     local rules=""
 
     if [ "$BACKEND" = "nft" ]; then
-        # 用 awk 更稳健地提取 nftables 中的端口和目标 IP:端口
         rules=$(nft list table $NFT_TABLE 2>/dev/null | awk '
             /dnat/ {
                 lport=""; tip=""; tport="";
@@ -248,7 +241,6 @@ test_port_forward() {
             }
         ' | sort -u)
     else
-        # 适配 iptables 格式解析
         rules=$(iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | \
             grep -i "DNAT" | awk '{
                 lport=""; tip=""; tport="";
@@ -313,7 +305,7 @@ list_rules() {
         iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null
         echo -e "\n${GREEN}--- POSTROUTING (MASQUERADE) ---${RESET}"
         iptables -t nat -L POSTROUTING -n -v --line-numbers 2>/dev/null
-        echo -e "\n${GREEN}--- FORWARD ---${RESET}"
+        echo -e "${GREEN}--- FORWARD ---${RESET}"
         iptables -L FORWARD -n -v --line-numbers 2>/dev/null
     fi
 }
@@ -321,14 +313,12 @@ list_rules() {
 # ================= 清理 =================
 clear_rules() {
     echo -e "\n${RED}[!] 警告：即将清空 NAT 规则以及 FORWARD 放行规则！${RESET}"
+    echo -e "${YELLOW}[i] 如果服务器上运行了 Docker 或其他网络服务，请谨慎操作。${RESET}"
     read -p "确认清空？(y/N): " confirm
     [[ "$confirm" != "y" && "$confirm" != "Y" ]] && { echo "已取消操作。"; return; }
 
     if [ "$BACKEND" = "nft" ]; then
-        # 清空 nat 表
         nft flush table $NFT_TABLE 2>/dev/null && echo -e "${GREEN}[√] nft 表 $NFT_TABLE 已清空。${RESET}"
-        
-        # 清理 filter 表的 FORWARD 链（将其恢复为默认 policy accept 且无多余规则）
         if nft list table ip filter &>/dev/null; then
             nft flush chain ip filter FORWARD 2>/dev/null
             echo -e "${GREEN}[√] nft 表 ip filter 的 FORWARD 链已清空。${RESET}"
