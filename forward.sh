@@ -228,11 +228,19 @@ test_port_forward() {
     local rules=""
 
     if [ "$BACKEND" = "nft" ]; then
-        # 适配 nftables 格式解析: dnat to IP:PORT
-        rules=$(nft list table $NFT_TABLE 2>/dev/null | \
-            grep -E 'dnat to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | \
-            sed -E 's/.*(tcp|udp) dport ([0-9]+).*dnat to ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+).*/\2 \3 \4/' | \
-            sort -u)
+        # 用 awk 更稳健地提取 nftables 中的端口和目标 IP:端口
+        rules=$(nft list table $NFT_TABLE 2>/dev/null | awk '
+            /dnat/ {
+                lport=""; tip=""; tport="";
+                for(i=1; i<=NF; i++){
+                    if ($i == "dport" && $(i-1) ~ /^(tcp|udp)$/) { lport=$(i+1) }
+                    if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/) {
+                        split($i, c, ":"); tip=c[1]; tport=c[2]
+                    }
+                }
+                if (lport != "" && tip != "" && tport != "") print lport" "tip" "tport
+            }
+        ' | sort -u)
     else
         # 适配 iptables 格式解析
         rules=$(iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | \
