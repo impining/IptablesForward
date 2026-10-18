@@ -1,8 +1,13 @@
 #!/bin/bash
-#
-# Linux 端口转发工具（nft / iptables 后端自动适配）
+
+## Linux 端口转发工具（nft / iptables 后端自动适配）
 # 测试口径: 本机 -> 目标IP:目标端口 直连可达性
-#
+
+#GREEN='\033[32m'
+#RED='\033[31m'
+#YELLOW='\033[33m'
+#CYAN='\033[36m'
+#RESET='\033[0m'
 
 GREEN='\033[32m'
 RED='\033[31m'
@@ -99,11 +104,11 @@ ensure_nft_forward_accept() {
 
     existing=$(nft list chain ip filter "$fchain" 2>/dev/null)
 
-    if ! echo "$existing" | grep -qE "ip daddr $tip_esc tcp dport $tport\b"; then
+    if ! echo "$existing" | grep -qE "ip daddr $tip_esc tcp dport$tport\b"; then
         nft add rule ip filter "$fchain" ip daddr "$tip" tcp dport "$tport" counter accept
         echo -e "${GREEN}  + FORWARD 放行 TCP $tip:$tport${RESET}"
     fi
-    if ! echo "$existing" | grep -qE "ip daddr $tip_esc udp dport $tport\b"; then
+    if ! echo "$existing" | grep -qE "ip daddr $tip_esc udp dport$tport\b"; then
         nft add rule ip filter "$fchain" ip daddr "$tip" udp dport "$tport" counter accept
         echo -e "${GREEN}  + FORWARD 放行 UDP $tip:$tport${RESET}"
     fi
@@ -116,7 +121,6 @@ ensure_nft_forward_accept() {
 # ================= 添加转发 =================
 add_port_forward() {
     check_and_enable_ip_forward
-
     echo -e "\n${YELLOW}[2/3] 输入转发参数:${RESET}"
     read -p "本机端口 (a): " a
     read -p "目标 IP (b): " b
@@ -135,51 +139,50 @@ add_port_forward() {
     echo -e "\n添加规则: 本机:$a -> $b:$c ..."
 
     if [ "$BACKEND" = "nft" ]; then
-        nft list table $NFT_TABLE &>/dev/null || nft add table $NFT_TABLE
+        nft list table $NFT_TABLE &>/dev/null \vert{}\vert{} nft add table$NFT_TABLE
         nft list chain $NFT_TABLE prerouting &>/dev/null || \
             nft add chain $NFT_TABLE prerouting '{ type nat hook prerouting priority dstnat; }'
         nft list chain $NFT_TABLE postrouting &>/dev/null || \
             nft add chain $NFT_TABLE postrouting '{ type nat hook postrouting priority srcnat; }'
 
         local existing_nat b_esc
-        existing_nat=$(nft list table $NFT_TABLE 2>/dev/null)
+        existing_nat=$(nft list table$NFT_TABLE 2>/dev/null)
         b_esc=$(escape_dots "$b")
 
-        if ! echo "$existing_nat" | grep -qE "tcp dport $a\b.*dnat to $b_esc:$c\b"; then
-            nft add rule $NFT_TABLE prerouting tcp dport "$a" dnat to "$b:$c"
-            echo -e "${GREEN}  + DNAT TCP :$a -> $b:$c${RESET}"
+        if ! echo "$existing_nat" | grep -qE "tcp dport $a\b.*dnat ip to $b_esc:$c\b"; then
+            nft add rule $NFT_TABLE prerouting tcp dport "$a" dnat ip to "$b:$c"
+            echo -e "${GREEN}  + DNAT TCP :$a ->$b:$c${RESET}"
         else
-            echo -e "${YELLOW}  = DNAT TCP :$a -> $b:$c 已存在，跳过${RESET}"
-        fi
-        if ! echo "$existing_nat" | grep -qE "udp dport $a\b.*dnat to $b_esc:$c\b"; then
-            nft add rule $NFT_TABLE prerouting udp dport "$a" dnat to "$b:$c"
-            echo -e "${GREEN}  + DNAT UDP :$a -> $b:$c${RESET}"
-        else
-            echo -e "${YELLOW}  = DNAT UDP :$a -> $b:$c 已存在，跳过${RESET}"
+            echo -e "${YELLOW}  = DNAT TCP :$a ->$b:$c 已存在，跳过${RESET}"
         fi
 
-        if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc tcp dport $c\b.*masquerade"; then
-            nft add rule $NFT_TABLE postrouting ip daddr "$b" tcp dport "$c" masquerade
-            echo -e "${GREEN}  + MASQ TCP $b:$c${RESET}"
+        if ! echo "$existing_nat" | grep -qE "udp dport $a\b.*dnat ip to $b_esc:$c\b"; then
+            nft add rule $NFT_TABLE prerouting udp dport "$a" dnat ip to "$b:$c"
+            echo -e "${GREEN}  + DNAT UDP :$a ->$b:$c${RESET}"
+        else
+            echo -e "${YELLOW}  = DNAT UDP :$a ->$b:$c 已存在，跳过${RESET}"
         fi
-        if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc udp dport $c\b.*masquerade"; then
+
+        if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc tcp dport$c\b.*masquerade"; then
+            nft add rule $NFT_TABLE postrouting ip daddr "$b" tcp dport "$c" masquerade
+            echo -e "${GREEN}  + MASQ TCP$b:$c${RESET}"
+        fi
+
+        if ! echo "$existing_nat" | grep -qE "ip daddr $b_esc udp dport$c\b.*masquerade"; then
             nft add rule $NFT_TABLE postrouting ip daddr "$b" udp dport "$c" masquerade
-            echo -e "${GREEN}  + MASQ UDP $b:$c${RESET}"
+            echo -e "${GREEN}  + MASQ UDP$b:$c${RESET}"
         fi
 
         ensure_nft_forward_accept "$b" "$c"
-
     else
         iptables -t nat -C POSTROUTING -d "$b" -p tcp --dport "$c" -j MASQUERADE 2>/dev/null || \
             iptables -t nat -A POSTROUTING -d "$b" -p tcp --dport "$c" -j MASQUERADE
         iptables -t nat -C POSTROUTING -d "$b" -p udp --dport "$c" -j MASQUERADE 2>/dev/null || \
             iptables -t nat -A POSTROUTING -d "$b" -p udp --dport "$c" -j MASQUERADE
-
         iptables -t nat -C PREROUTING -p tcp --dport "$a" -j DNAT --to-destination "$b:$c" 2>/dev/null || \
             iptables -t nat -A PREROUTING -p tcp --dport "$a" -j DNAT --to-destination "$b:$c"
         iptables -t nat -C PREROUTING -p udp --dport "$a" -j DNAT --to-destination "$b:$c" 2>/dev/null || \
             iptables -t nat -A PREROUTING -p udp --dport "$a" -j DNAT --to-destination "$b:$c"
-
         iptables -C FORWARD -p tcp -d "$b" --dport "$c" -j ACCEPT 2>/dev/null || \
             iptables -A FORWARD -p tcp -d "$b" --dport "$c" -j ACCEPT
         iptables -C FORWARD -p udp -d "$b" --dport "$c" -j ACCEPT 2>/dev/null || \
@@ -189,7 +192,7 @@ add_port_forward() {
     fi
 
     echo -e "${GREEN}[√] 添加完成。${RESET}"
-
+    
     # 添加后直接测目标端口可达性
     echo -ne "目标 ${CYAN}$b:$c${RESET} 可达性: "
     exec_test "$b" "$c"
@@ -225,11 +228,13 @@ test_port_forward() {
     local rules=""
 
     if [ "$BACKEND" = "nft" ]; then
-        rules=$(nft list table $NFT_TABLE 2>/dev/null | \
-            grep -E 'dnat to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | \
-            sed -E 's/.*(tcp|udp) dport ([0-9]+).*dnat to ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+).*/\2 \3 \4/' | \
+        # 适配 nftables 格式解析: dnat ip to IP:PORT
+        rules=$(nft list table$NFT_TABLE 2>/dev/null | \
+            grep -E 'dnat ip to [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+' | \
+            sed -E 's/.*(tcp|udp) dport ([0-9]+).*dnat ip to ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):([0-9]+).*/\2 \3 \4/' | \
             sort -u)
     else
+        # 适配 iptables 格式解析
         rules=$(iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | \
             grep -i "DNAT" | awk '{
                 lport=""; tip=""; tport="";
@@ -246,32 +251,37 @@ test_port_forward() {
     fi
 
     if [ -z "$rules" ]; then
-        echo -e "${RED}[!] 未抓到 DNAT 规则。${RESET}"
-        read -p "手动输入 目标 IP: " m_ip
-        read -p "手动输入 目标端口: " m_port
-        if validate_ipv4 "$m_ip" && validate_port "$m_port"; then
-            echo -ne "目标 ${CYAN}$m_ip:$m_port${RESET} 可达性: "
-            exec_test "$m_ip" "$m_port"
-        else
-            echo -e "${RED}[!] 输入非法。${RESET}"
+        echo -e "${RED}[!] 未抓到自动生成的 DNAT 规则。${RESET}"
+        read -p "是否手动输入目标 IP:端口 进行测试？(y/N): " manual_choice
+        if [[ "$manual_choice" == "y" \vert{}\vert{} "$manual_choice" == "Y" ]]; then
+            read -p "手动输入 目标 IP: " m_ip
+            read -p "手动输入 目标端口: " m_port
+            if validate_ipv4 "$m_ip" && validate_port "$m_port"; then
+                echo -ne "目标 ${CYAN}$m_ip:$m_port${RESET} 可达性: "
+                exec_test "$m_ip" "$m_port"
+            else
+                echo -e "${RED}[!] 输入非法。${RESET}"
+            fi
         fi
         return
     fi
 
-    # 去重（进程替换，父 shell 生效）
+    # 去重处理
     local seen="" unique=""
     while read -r lp tip tp; do
+        [ -z "$lp" ] && continue
         local key="${lp}-${tip}-${tp}"
-        if echo " $seen " | grep -qF " $key "; then
+        if echo " $seen " \vert{} grep -qF " $key "; then
             continue
         fi
-        seen="$seen $key"
-        unique="${unique}${lp} ${tip} ${tp}"$'\n'
+        seen="$seen$key"
+        unique="${unique}${lp}${tip} ${tp}"$'\n'
     done < <(echo "$rules")
 
+    # 循环测试每一条规则
     while read -r lp tip tp; do
         [ -z "$lp" ] && continue
-        echo -ne "入口 ${CYAN}$lp${RESET} -> 目标 ${CYAN}$tip:$tp${RESET} | 目标可达性: "
+        echo -ne "入口端口 ${CYAN}$lp${RESET} -> 目标 ${CYAN}$tip:$tp${RESET} | 可达性: "
         exec_test "$tip" "$tp"
     done < <(echo "$unique")
 }
@@ -283,61 +293,4 @@ list_rules() {
         echo -e "${GREEN}--- nft 表 $NFT_TABLE ---${RESET}"
         nft list table $NFT_TABLE 2>/dev/null || echo "（表不存在）"
         echo -e "\n${GREEN}--- nft 表 ip filter FORWARD ---${RESET}"
-        nft list chain ip filter FORWARD 2>/dev/null || echo "（链不存在）"
-    else
-        echo -e "${GREEN}--- PREROUTING (DNAT) ---${RESET}"
-        iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null
-        echo -e "\n${GREEN}--- POSTROUTING (MASQUERADE) ---${RESET}"
-        iptables -t nat -L POSTROUTING -n -v --line-numbers 2>/dev/null
-        echo -e "\n${GREEN}--- FORWARD ---${RESET}"
-        iptables -L FORWARD -n -v --line-numbers 2>/dev/null
-    fi
-}
-
-# ================= 清理 =================
-clear_rules() {
-    echo -e "\n${RED}[!] 即将清空 NAT 表规则（会删除该表所有规则，含非本脚本添加的，不含 FORWARD）。${RESET}"
-    read -p "确认？(y/N): " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
-
-    if [ "$BACKEND" = "nft" ]; then
-        nft flush table $NFT_TABLE 2>/dev/null && echo -e "${GREEN}[√] nft 表 $NFT_TABLE 已清空。${RESET}"
-    else
-        iptables -t nat -F && echo -e "${GREEN}[√] iptables nat 表已清空。${RESET}"
-    fi
-    echo -e "${YELLOW}[i] FORWARD 链规则未动，如需清理请手动处理。${RESET}"
-}
-
-# ================= 退出 =================
-exit_script() {
-    echo -e "${GREEN}已退出。${RESET}"
-    exit 0
-}
-
-# ================= 主菜单 =================
-main_menu() {
-    while true; do
-        echo -e "\n${GREEN}========================================${RESET}"
-        echo -e "${GREEN}   Linux 端口转发工具 (后端: $BACKEND)   ${RESET}"
-        echo -e "${GREEN}========================================${RESET}"
-        echo -e " 1. 检查/开启 IP 转发"
-        echo -e " 2. 添加端口转发规则 (a -> b:c)"
-        echo -e " 3. 测试已有转发（本机 -> 目标端口）"
-        echo -e " 4. 查看当前 NAT / FORWARD 规则"
-        echo -e " 5. 清空 NAT 规则"
-        echo -e " 0. 退出"
-        echo -e "${GREEN}----------------------------------------${RESET}"
-        read -p "选项 [0-5]: " choice
-        case "$choice" in
-            1) check_and_enable_ip_forward ;;
-            2) add_port_forward ;;
-            3) test_port_forward ;;
-            4) list_rules ;;
-            5) clear_rules ;;
-            0) exit_script ;;
-            *) echo -e "${RED}[!] 无效选项。${RESET}" ;;
-        esac
-    done
-}
-
-main_menu
+        nft list chain ip filter FORWARD 2>/dev/null ||
