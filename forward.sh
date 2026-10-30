@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #===============================================================================
-#  portfwd - Linux 端口转发管理工具  v3.0.0
+#  forward - Linux 端口转发管理工具  v3.0.0
 #
 #  一条命令搞定: 端口转发 + 防火墙后端兼容(iptables/nftables/firewalld)
 #                + 开机自动恢复(systemd/OpenRC/SysVinit) + ip_forward 持久化
@@ -9,13 +9,13 @@
 #            RHEL / CentOS / Rocky / AlmaLinux / Fedora / Oracle Linux
 #            Arch / Manjaro / openSUSE / SLES / Alpine / Gentoo
 #
-#  用法: portfwd                     交互菜单(推荐)
-#        portfwd add -p tcp -l 8080 -d 10.0.0.5 -t 80
-#        portfwd list | del 8080 | apply | status | clear
-#        portfwd install            安装开机自启(重启后规则自动恢复)
-#        portfwd --help             完整帮助
+#  用法: forward                     交互菜单(推荐)
+#        forward add -p tcp -l 8080 -d 10.0.0.5 -t 80
+#        forward list | del 8080 | apply | status | clear
+#        forward install            安装开机自启(重启后规则自动恢复)
+#        forward --help             完整帮助
 #
-#  说明: 规则保存在 /etc/portfwd/rules.conf, 该文件是唯一事实来源,
+#  说明: 规则保存在 /etc/forward/rules.conf, 该文件是唯一事实来源,
 #        apply 会按文件内容重建防火墙规则(只动自己的规则, 不碰 Docker/ufw)。
 #===============================================================================
 
@@ -29,24 +29,24 @@ set -u
 #-------------------------------------------------------------------------------
 # 常量与全局变量
 #-------------------------------------------------------------------------------
-readonly PROG="portfwd"
-readonly VERSION="3.0.0"
+readonly PROG="forward"
+readonly VERSION="3.1.0"
 
 # 所有路径都可用环境变量覆盖, 便于测试/容器内使用
-readonly CONF_DIR="${PORTFWD_CONF_DIR:-/etc/portfwd}"
+readonly CONF_DIR="${FORWARD_CONF_DIR:-/etc/forward}"
 readonly RULES_FILE="$CONF_DIR/rules.conf"
 readonly APPLIED_FILE="$CONF_DIR/applied.conf"
 readonly STATE_FILE="$CONF_DIR/state.conf"
-readonly SYSCTL_DIR="${PORTFWD_SYSCTL_DIR:-/etc/sysctl.d}"
-readonly SYSCTL_FILE="$SYSCTL_DIR/zz-portfwd.conf"
-readonly SYSCTL_CONF="${PORTFWD_SYSCTL_CONF:-/etc/sysctl.conf}"
-readonly SELF_BIN="${PORTFWD_SELF_BIN:-/usr/local/sbin/portfwd}"
-readonly SYSTEMD_UNIT="${PORTFWD_UNIT_DIR:-/etc/systemd/system}/portfwd.service"
-readonly INIT_SCRIPT="/etc/init.d/portfwd"
+readonly SYSCTL_DIR="${FORWARD_SYSCTL_DIR:-/etc/sysctl.d}"
+readonly SYSCTL_FILE="$SYSCTL_DIR/zz-forward.conf"
+readonly SYSCTL_CONF="${FORWARD_SYSCTL_CONF:-/etc/sysctl.conf}"
+readonly SELF_BIN="${FORWARD_SELF_BIN:-/usr/local/sbin/forward}"
+readonly SYSTEMD_UNIT="${FORWARD_UNIT_DIR:-/etc/systemd/system}/forward.service"
+readonly INIT_SCRIPT="/etc/init.d/forward"
 
-readonly NFT_TABLE="portfwd"       # nft 后端独占的表名: table ip portfwd
-readonly NFT_TAG="portfwd"         # nft 规则注释, 用于识别自己的规则
-readonly IPT_TAG="portfwd"         # iptables 规则注释前缀: portfwd:<端口>:<协议>
+readonly NFT_TABLE="forward"       # nft 后端独占的表名: table ip forward
+readonly NFT_TAG="forward"         # nft 规则注释, 用于识别自己的规则
+readonly IPT_TAG="forward"         # iptables 规则注释前缀: forward:<端口>:<协议>
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -101,7 +101,7 @@ die()  { err "$*"; exit 1; }
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
 need_root() {
-    [ "${PORTFWD_FAKE_ROOT:-0}" = 1 ] && return 0
+    [ "${FORWARD_FAKE_ROOT:-0}" = 1 ] && return 0
     [ "$(id -u)" -eq 0 ] || die "需要 root 权限: 请使用 sudo $PROG ..."
 }
 
@@ -143,9 +143,9 @@ pkg_hint() {   # $1=包名
 }
 
 init_system() {
-    # 可用 PORTFWD_INIT=systemd|openrc|sysvinit 强制指定(容器/非常规 init)
-    if [ -n "${PORTFWD_INIT:-}" ]; then
-        printf '%s' "$PORTFWD_INIT"
+    # 可用 FORWARD_INIT=systemd|openrc|sysvinit 强制指定(容器/非常规 init)
+    if [ -n "${FORWARD_INIT:-}" ]; then
+        printf '%s' "$FORWARD_INIT"
         return 0
     fi
     if [ -d /run/systemd/system ] && cmd_exists systemctl; then
@@ -286,7 +286,8 @@ norm_file() {
             1|yes|true|on) masq=1 ;;
             *) masq=0 ;;
         esac
-        printf '%s %s %s %s %s\n' "$p" "$((10#$lp))" "$dip" "$((10#$dp))" "$masq"
+        # 下游可能用 head/grep -q 提前退出(会 SIGPIPE), 这类 "write error" 无意义, 直接吞掉
+        printf '%s %s %s %s %s\n' "$p" "$((10#$lp))" "$dip" "$((10#$dp))" "$masq" 2>/dev/null
     done < "$f"
 }
 
@@ -339,7 +340,7 @@ backup_rules() {
     local b old
     b="$RULES_FILE.bak.$(date +%Y%m%d%H%M%S)"
     cp -f "$RULES_FILE" "$b" 2>/dev/null && info "规则已备份: $b"
-    # 只保留最近 5 份备份, 避免 /etc/portfwd 无限增长
+    # 只保留最近 5 份备份, 避免 /etc/forward 无限增长
     old=$(ls -1t "$RULES_FILE".bak.* 2>/dev/null | tail -n +6)
     [ -n "$old" ] && printf '%s\n' "$old" | while IFS= read -r f; do rm -f "$f"; done
     return 0
@@ -374,7 +375,7 @@ auto_backend() {
 }
 
 current_backend() {   # 非致命版: 仅用于展示/查询
-    local b="${OPT_BACKEND:-${PORTFWD_BACKEND:-$(state_get backend)}}"
+    local b="${OPT_BACKEND:-${FORWARD_BACKEND:-$(state_get backend)}}"
     [ -z "$b" ] && b=auto
     if [ "$b" = auto ]; then
         auto_backend
@@ -385,7 +386,7 @@ current_backend() {   # 非致命版: 仅用于展示/查询
 
 resolve_backend() {
     local b
-    b="${OPT_BACKEND:-${PORTFWD_BACKEND:-$(state_get backend)}}"
+    b="${OPT_BACKEND:-${FORWARD_BACKEND:-$(state_get backend)}}"
     [ -z "$b" ] && b=auto
     case "$b" in
         auto)
@@ -488,24 +489,26 @@ ipt_init() {
 }
 
 # 清掉自己加过的规则(按注释标记识别, 不碰别人的规则)
+# $3 可指定别的标记(迁移旧版本规则时用)
+# 用 "行号删除": 注释里可能带空格/引号, 从 -S 重新拼参数会拆词导致
+#   "Bad argument `old'"(实测), 而 -D 链名 行号 不受影响。
+SWEPT_COUNT=0
 ipt_sweep_chain() {
-    local tbl="$1" ch="$2" line args guard=0
+    local tbl="$1" ch="$2" tag="${3:-$IPT_TAG}" num guard=0
+    SWEPT_COUNT=0
     [ "$NO_COMMENT" = 1 ] && return 0
-    iptq -t "$tbl" -S "$ch" >/dev/null 2>&1 || return 0
+    iptq -t "$tbl" -L "$ch" -n >/dev/null 2>&1 || return 0
     while :; do
-        # 注释在 iptables -S 的输出里带引号(不同版本/不同内核可能不带), 故不用 grep 匹配引号
-        line=$(iptq -t "$tbl" -S "$ch" 2>/dev/null | awk -v tag="${IPT_TAG}:" '
-            index($0, "--comment") && index($0, tag) { print; exit }')
-        [ -z "$line" ] && break
-        args=${line#-A }        # 去掉开头的 "-A ", 保留链名(直接交给 -D)
-        args=${args//\"/}       # 去掉引号
+        num=$(iptq -t "$tbl" -L "$ch" -n --line-numbers 2>/dev/null | awk -v tag="${tag}:" '
+            $1 ~ /^[0-9]+$/ && index($0, tag) { print $1; exit }')
+        [ -z "$num" ] && break
         guard=$((guard + 1))
         if [ "$guard" -gt 2000 ]; then
             warn "清理 $tbl/$ch 时超过上限, 已中止"
             break
         fi
-        # shellcheck disable=SC2086
-        iptm -t "$tbl" -D $args || break
+        iptm -t "$tbl" -D "$ch" "$num" || break
+        SWEPT_COUNT=$((SWEPT_COUNT + 1))
     done
 }
 
@@ -534,6 +537,9 @@ ipt_rule_specs() {   # proto lport dip dport masq -> 每行输出 "table|action|
                 "$p" "$dp" "$c"
         else
             printf 'filter|I|FORWARD|-p %s -d %s --dport %s -m comment --comment %s -j ACCEPT\n' \
+                "$p" "$dip" "$dp" "$c"
+            # 回程方向: 服务端回来时已经过 conntrack 还原, 源是 DIP:DP
+            printf 'filter|I|FORWARD|-p %s -s %s --sport %s -m comment --comment %s -j ACCEPT\n' \
                 "$p" "$dip" "$dp" "$c"
             if [ "$m" = 1 ]; then
                 printf 'nat|A|POSTROUTING|-p %s -d %s --dport %s -m comment --comment %s -j MASQUERADE\n' \
@@ -570,6 +576,9 @@ ipt_apply() {
                 ipt_add filter I FORWARD -p "$p" -d "$dip" --dport "$dp" \
                     "${IPT_C_ARGS[@]+"${IPT_C_ARGS[@]}"}" \
                     -j ACCEPT || { err "放行 FORWARD 失败: $p/$lp"; rc=1; }
+                ipt_add filter I FORWARD -p "$p" -s "$dip" --sport "$dp" \
+                    "${IPT_C_ARGS[@]+"${IPT_C_ARGS[@]}"}" \
+                    -j ACCEPT || { err "放行 FORWARD(回程) 失败: $p/$lp"; rc=1; }
                 if [ "$m" = 1 ]; then
                     ipt_add nat A POSTROUTING -p "$p" -d "$dip" --dport "$dp" \
                         "${IPT_C_ARGS[@]+"${IPT_C_ARGS[@]}"}" \
@@ -606,7 +615,7 @@ ipt_clear() {
 }
 
 #-------------------------------------------------------------------------------
-# nftables 后端 (独占表 ip portfwd, 每次全量原子重建)
+# nftables 后端 (独占表 ip forward, 每次全量原子重建)
 #-------------------------------------------------------------------------------
 nftm() {   # 修改(遵循 --dry-run)
     if [ "$DRY_RUN" = 1 ]; then
@@ -656,11 +665,11 @@ nft_hook_chains() {   # $1 = forward|input
     '
 }
 
-# 删除指定链里我们加过的规则(按 comment portfwd 识别; 不同 nft 版本对 comment 的引号处理不同, 故不做严格匹配)
+# 删除指定链里我们加过的规则(按 comment forward 识别; 不同 nft 版本对 comment 的引号处理不同, 故不做严格匹配)
 nft_purge_chain() {   # fam tbl chain
     local fam="$1" tbl="$2" ch="$3" h
     for h in $(nft -a list chain "$fam" "$tbl" "$ch" 2>/dev/null \
-                | awk '/comment/ && /portfwd/ {print $NF}'); do
+                | awk '/comment/ && /forward/ {print $NF}'); do
         case "$h" in ''|*[!0-9]*) continue ;; esac
         nftm delete rule "$fam" "$tbl" "$ch" handle "$h" 2>/dev/null || true
     done
@@ -704,6 +713,11 @@ nft_sync_hook() {   # $1 = forward|input
                         ip daddr "$dip" "$p" dport "$dp" accept comment "$NFT_TAG" 2>/dev/null; then
                     NFT_HOOK_INSERTED=$((NFT_HOOK_INSERTED + 1))
                 fi
+                # 回程方向(conntrack 还原后源地址是 DIP:DP)
+                if nftm insert rule "$fam" "$tbl" "$ch" \
+                        ip saddr "$dip" "$p" sport "$dp" accept comment "$NFT_TAG" 2>/dev/null; then
+                    NFT_HOOK_INSERTED=$((NFT_HOOK_INSERTED + 1))
+                fi
             done < <(norm_rules)
         else
             while read -r p lp dip dp m; do
@@ -722,7 +736,7 @@ nft_sync_hook() {   # $1 = forward|input
 # 人类可读的完整规则集(用于 --dry-run 预览与日志)
 nft_preview() {
     local p lp dip dp m mode
-    printf '# 由 portfwd 生成, 规则来源 %s\n' "$RULES_FILE"
+    printf '# 由 forward 生成, 规则来源 %s\n' "$RULES_FILE"
     printf 'table ip %s {\n' "$NFT_TABLE"
     printf '\tchain prerouting {\n'
     printf '\t\ttype nat hook prerouting priority -100; policy accept;\n'
@@ -830,10 +844,10 @@ fw_query() { firewall-cmd "$@" >/dev/null 2>&1; }
 fw_init() {
     cmd_exists firewall-cmd || { err "未找到 firewall-cmd, 安装: $(pkg_hint firewalld)"; return 1; }
     firewalld_running || { err "firewalld 未运行, 请先 systemctl start firewalld"; return 1; }
-    ZONE="${OPT_ZONE:-${PORTFWD_ZONE:-$(firewall-cmd --get-default-zone 2>/dev/null)}}"
+    ZONE="${OPT_ZONE:-${FORWARD_ZONE:-$(firewall-cmd --get-default-zone 2>/dev/null)}}"
     [ -z "$ZONE" ] && ZONE=public
     if ! firewall-cmd --get-zones 2>/dev/null | tr ' ' '\n' | grep -qx "$ZONE"; then
-        if [ -n "${OPT_ZONE:-}${PORTFWD_ZONE:-}" ]; then
+        if [ -n "${OPT_ZONE:-}${FORWARD_ZONE:-}" ]; then
             err "指定的 firewalld 区域不存在: $ZONE"
             return 1
         fi
@@ -931,7 +945,7 @@ persist_ip_forward() {
     if ! grep -qs '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1' "$SYSCTL_FILE" 2>/dev/null; then
         if mkdir -p "$SYSCTL_DIR" 2>/dev/null; then
             {
-                printf '# 由 portfwd 生成: 端口转发需要开启 IPv4 路由转发\n'
+                printf '# 由 forward 生成: 端口转发需要开启 IPv4 路由转发\n'
                 printf '%s\n' "$want"
             } > "$SYSCTL_FILE" 2>/dev/null \
                 && { chmod 644 "$SYSCTL_FILE" 2>/dev/null || true; } \
@@ -952,7 +966,7 @@ persist_ip_forward() {
                      END { exit(found ? 0 : 1) }' "$SYSCTL_CONF" 2>/dev/null; then
                 local tmp
                 tmp=$(mktemp "$(dirname "$SYSCTL_CONF")/.sysctl.XXXXXX" 2>/dev/null) || return 0
-                cp -f "$SYSCTL_CONF" "$SYSCTL_CONF.portfwd.bak" 2>/dev/null || true
+                cp -f "$SYSCTL_CONF" "$SYSCTL_CONF.forward.bak" 2>/dev/null || true
                 awk 'BEGIN{ done=0 }
                      /^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/ {
                          if (!done) { print "net.ipv4.ip_forward = 1"; done=1 }
@@ -994,10 +1008,250 @@ save_applied() {
     chmod 600 "$APPLIED_FILE" 2>/dev/null || true
 }
 
+#-------------------------------------------------------------------------------
+# 诊断: 规则"明明有但识别不到"时, 把环境、配置、后端原始输出全打出来
+#-------------------------------------------------------------------------------
+do_doctor() {
+    need_root
+    invalidate_rules_cache
+    local b init zone
+    init=$(init_system)
+    b=$(current_backend)
+
+    log "==== 环境 ===="
+    printf '  %-12s %s\n' "版本"       "$VERSION"
+    printf '  %-12s %s\n' "发行版"     "$(distro_name)"
+    printf '  %-12s %s\n' "内核"       "$(uname -r 2>/dev/null)"
+    printf '  %-12s %s\n' "init"       "${init:-未识别}"
+    printf '  %-12s %s\n' "后端"       "${b:-未探测到}"
+    printf '  %-12s %s\n' "ip_forward" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '?')"
+    printf '  %-12s %s\n' "配置目录"   "$CONF_DIR"
+    printf '  %-12s %s\n' "开机自启"   "$(persist_enabled && echo 已启用 || echo 未启用)"
+
+    log "==== 解析出的规则 (proto lport dest kind) ===="
+    if [ -n "$(installed_rules)" ]; then
+        installed_rules | sed 's/^/  /'
+    else
+        printf '  (空)\n'
+    fi
+
+    log "==== 配置: $RULES_FILE ===="
+    if [ -f "$RULES_FILE" ]; then sed 's/^/  /' "$RULES_FILE"; else printf '  (文件不存在)\n'; fi
+    log "==== 快照: $APPLIED_FILE ===="
+    if [ -f "$APPLIED_FILE" ]; then sed 's/^/  /' "$APPLIED_FILE"; else printf '  (文件不存在)\n'; fi
+    log "==== 状态: $STATE_FILE ===="
+    if [ -f "$STATE_FILE" ]; then sed 's/^/  /' "$STATE_FILE"; else printf '  (文件不存在)\n'; fi
+
+    log "==== 后端原始输出 ===="
+    case "$b" in
+        iptables)
+            printf '  $ iptables -t nat -S\n'
+            iptq -t nat -S 2>&1 | sed 's/^/    /'
+            printf '  $ iptables -S FORWARD\n'
+            iptq -S FORWARD 2>&1 | sed 's/^/    /'
+            ;;
+        nft)
+            printf '  $ nft list table ip %s\n' "$NFT_TABLE"
+            nft list table ip "$NFT_TABLE" 2>&1 | sed 's/^/    /'
+            printf '  $ nft list chains\n'
+            nft list chains 2>&1 | sed 's/^/    /'
+            ;;
+        firewalld)
+            zone=$(fw_zone)
+            printf '  $ firewall-cmd --zone=%s --list-all\n' "$zone"
+            firewall-cmd --zone="$zone" --list-all 2>&1 | sed 's/^/    /'
+            ;;
+        *)
+            printf '  (没有可用后端: 检查 iptables / nft / firewall-cmd 是否安装可用)\n'
+            ;;
+    esac
+
+    log "==== 自启状态 ===="
+    case "$init" in
+        systemd)
+            systemctl status forward.service --no-pager 2>&1 | sed 's/^/  /' | head -n 12
+            ;;
+        openrc)
+            rc-service forward status 2>&1 | sed 's/^/  /'
+            ;;
+        sysvinit)
+            ls -l /etc/rc2.d/S??forward /etc/rc3.d/S??forward /etc/rc.d/rc3.d/S??forward 2>/dev/null \
+                | sed 's/^/  /' || printf '  (没有 rc 链接)\n'
+            ;;
+        *)
+            printf '  (未识别的 init)\n'
+            ;;
+    esac
+    return 0
+}
+
+#-------------------------------------------------------------------------------
+# 旧版本(命令名 portfwd)迁移
+#   旧版把规则放在 /etc/portfwd、nft 用 table ip portfwd、iptables 注释是 portfwd:
+#   升级后这些规则会变成"没有工具管"的孤儿, 所以这里一次性收编: 配置搬过来、旧规则删掉。
+#   路径都可用 FORWARD_LEGACY_* 覆盖(测试用), 迁移只做一次(state 里记 legacy=done)。
+#-------------------------------------------------------------------------------
+LEGACY_DIR="${FORWARD_LEGACY_DIR:-$(dirname "$CONF_DIR")/portfwd}"
+LEGACY_BIN="${FORWARD_LEGACY_BIN:-/usr/local/sbin/portfwd}"
+LEGACY_NFT_TABLE="${FORWARD_LEGACY_NFT-portfwd}"
+LEGACY_UNIT="${FORWARD_LEGACY_UNIT:-/etc/systemd/system/portfwd.service}"
+LEGACY_INIT="${FORWARD_LEGACY_INIT:-/etc/init.d/portfwd}"
+
+legacy_sweep_one() {   # table chain
+    ipt_sweep_chain "$1" "$2" "portfwd"
+    [ "$SWEPT_COUNT" -gt 0 ]
+}
+
+# 旧版残留是否还在(即使之前迁移过, 也允许再清理一次; 比如后来手工跑过旧脚本)
+legacy_artifacts_exist() {
+    [ -f "$LEGACY_BIN" ] && return 0
+    [ -f "$LEGACY_UNIT" ] && return 0
+    [ -f "$LEGACY_INIT" ] && return 0
+    if [ -d "$LEGACY_DIR" ] && [ "$LEGACY_DIR" != "$CONF_DIR" ] && [ -s "$LEGACY_DIR/rules.conf" ]; then
+        return 0
+    fi
+    if [ -n "$LEGACY_NFT_TABLE" ] && cmd_exists nft \
+       && nft list table ip "$LEGACY_NFT_TABLE" >/dev/null 2>&1; then
+        return 0
+    fi
+    if cmd_exists iptables && iptables -t nat -S 2>/dev/null | grep -q -- "--comment \"portfwd:"; then
+        return 0
+    fi
+    return 1
+}
+
+legacy_migrate() {
+    [ "${FORWARD_NO_LEGACY:-0}" = 1 ] && return 0
+    if [ "$(state_get legacy)" = "done" ] && ! legacy_artifacts_exist; then
+        return 0
+    fi
+    local moved=0
+
+    # 1) 旧配置文件
+    if [ -d "$LEGACY_DIR" ] && [ "$LEGACY_DIR" != "$CONF_DIR" ]; then
+        ensure_conf_dir >/dev/null 2>&1 || true
+        if [ -s "$LEGACY_DIR/rules.conf" ] && [ ! -s "$RULES_FILE" ]; then
+            cp -f "$LEGACY_DIR/rules.conf" "$RULES_FILE" 2>/dev/null && {
+                warn "已迁移旧配置: $LEGACY_DIR/rules.conf -> $RULES_FILE"
+                moved=1
+            }
+        fi
+        local f
+        for f in applied.conf state.conf; do
+            if [ -s "$LEGACY_DIR/$f" ] && [ ! -s "$CONF_DIR/$f" ]; then
+                cp -f "$LEGACY_DIR/$f" "$CONF_DIR/$f" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # 2) 旧 nft 表 table ip portfwd
+    if [ -n "$LEGACY_NFT_TABLE" ] && cmd_exists nft \
+       && nft list table ip "$LEGACY_NFT_TABLE" >/dev/null 2>&1; then
+        if [ "$DRY_RUN" = 1 ]; then
+            printf '  [dry-run] nft delete table ip %s\n' "$LEGACY_NFT_TABLE"
+        else
+            nft delete table ip "$LEGACY_NFT_TABLE" 2>/dev/null || true
+            warn "已删除旧版 nft 表 ip $LEGACY_NFT_TABLE"
+        fi
+        moved=1
+    fi
+
+    # 3) 旧 iptables 规则(注释为 portfwd:...)
+    if cmd_exists iptables; then
+        ipt_init >/dev/null 2>&1 || true
+        legacy_sweep_one nat PREROUTING && moved=1
+        legacy_sweep_one nat POSTROUTING && moved=1
+        legacy_sweep_one filter FORWARD && moved=1
+        legacy_sweep_one filter INPUT && moved=1
+    fi
+
+    # 4) 旧命令与自启文件
+    if [ -f "$LEGACY_BIN" ] && [ "$LEGACY_BIN" != "$SELF_BIN" ]; then
+        rm -f "$LEGACY_BIN" 2>/dev/null && { warn "已删除旧版命令 $LEGACY_BIN"; moved=1; }
+    fi
+    if [ -f "$LEGACY_UNIT" ]; then
+        systemctl disable "$(basename "$LEGACY_UNIT")" >/dev/null 2>&1 || true
+        rm -f "$LEGACY_UNIT" && {
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            warn "已移除旧版自启单元 $LEGACY_UNIT"
+            moved=1
+        }
+    fi
+    if [ -f "$LEGACY_INIT" ]; then
+        rm -f "$LEGACY_INIT" 2>/dev/null && moved=1
+    fi
+    rm -f /etc/rc2.d/S??portfwd /etc/rc3.d/S??portfwd \
+          /etc/rc5.d/S??portfwd /etc/rc.d/rc3.d/S??portfwd 2>/dev/null || true
+
+    ensure_conf_dir >/dev/null 2>&1 || true
+    state_set legacy done >/dev/null 2>&1 || true
+    [ "$moved" = 1 ] && ok "旧版(portfwd)残留已清理" || info "无旧版本残留"
+    return 0
+}
+
+# 切换后端时清理"另一个后端"里我们自己写下的规则。
+# 否则同一入口端口会被 DNAT 两遍(iptables 与 nft 各一条), 或者旧后端的放行规则一直残留。
+cleanup_other_backends() {
+    local want="$1"
+    if [ "$want" != iptables ] && [ -s "$APPLIED_FILE" ] && cmd_exists iptables; then
+        if ipt_clear >/dev/null 2>&1; then
+            info "已清理 iptables 后端留下的规则"
+        fi
+    fi
+    if [ "$want" != nft ] && cmd_exists nft; then
+        if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
+            if [ "$DRY_RUN" = 1 ]; then
+                printf '  [dry-run] nft delete table ip %s\n' "$NFT_TABLE"
+            else
+                nft delete table ip "$NFT_TABLE" 2>/dev/null \
+                    && info "已清理 nft 后端留下的表 ip $NFT_TABLE"
+            fi
+        fi
+        nft_clear_hooks
+    fi
+    if [ "$want" != firewalld ] && [ -s "$APPLIED_FILE" ] && firewalld_running; then
+        fw_remove_file "$APPLIED_FILE" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+# 内核里可能存在"同端口、不同目标"的规则(手工加的、别的容器工具加的、旧版本没写注释留下的),
+# 它们排在本工具的规则前面就会把流量抢走。这里只提示, 不自动删(可能是 Docker/K8s 的规则)。
+detect_conflicts() {
+    local bk p lp dest kind dip dp cp clp cdip cdp cm found=0
+    invalidate_rules_cache
+    while read -r bk p lp dest kind; do
+        case "$dest" in
+            *:*) dip="${dest%:*}"; dp="${dest##*:}" ;;
+            *)   dip="$dest";      dp="" ;;
+        esac
+        if [ "$kind" = "redirect" ]; then dip="127.0.0.1"; fi
+        [ -n "$dip" ] || dip="127.0.0.1"
+        if [ -n "$dp" ]; then
+            rule_in_conf "$p" "$lp" "$dip" "$dp" && continue
+        else
+            rule_in_conf "$p" "$lp" "$dip" "*" && continue
+        fi
+        while read -r cp clp cdip cdp cm; do
+            [ "$cp" = "$p" ] && [ "$clp" = "$lp" ] || continue
+            if [ "$cdip" != "$dip" ] || { [ -n "$dp" ] && [ "$cdp" != "$dp" ]; }; then
+                found=1
+                warn "内核里 ${p}/${lp} 还有一条指向 ${dip}:${dp:-?} 的规则(不是本工具写的), 可能先于本工具的规则生效"
+            fi
+        done < <(norm_rules)
+    done < <(installed_rules_any)
+    if [ "$found" = 1 ]; then
+        info "用 '$PROG doctor' 看原始规则; 确认多余后按后端手工删除, 或重新用 '$PROG add ...' 覆盖同一入口端口。"
+    fi
+    return 0
+}
+
 do_apply() {
     need_root
     ensure_conf_dir
     resolve_backend || return 1
+    legacy_migrate || true
+    cleanup_other_backends "$BACKEND"
     ensure_ip_forward
     local n
     n=$(count_rules)
@@ -1012,9 +1266,13 @@ do_apply() {
         save_applied
         state_set backend "$BACKEND"
         ok "规则已生效$( [ "$n" -eq 0 ] && printf '(当前没有规则, 已清空)' )"
+        if [ "$DRY_RUN" != 1 ] && [ "$n" -gt 0 ]; then
+            detect_conflicts
+        fi
     else
         err "规则应用失败"
     fi
+    invalidate_rules_cache
     return "$rc"
 }
 
@@ -1039,47 +1297,170 @@ do_clear() {
         : > "$APPLIED_FILE"
     fi
     ok "已清空所有转发规则"
+    invalidate_rules_cache
     return 0
 }
 
-check_rule_installed() {   # proto lport dip dport
-    local p="$1" lp="$2" dip="$3" dp="$4" b spec out
+#-------------------------------------------------------------------------------
+# 读取"内核/防火墙里实际存在"的转发规则
+#   统一输出: <proto> <lport> <dest> <kind>
+#     kind=dnat     dest 形如 10.0.0.5:80 (也可能是裸 IP, 表示端口不变)
+#     kind=redirect dest 形如 :80
+# 查看/测试都以真实规则为准, 不依赖本工具写下的注释标记,
+# 因此手工加的规则、别的工具加的规则、旧版本残留的规则都能被识别出来。
+#-------------------------------------------------------------------------------
+fw_zone() {
+    local z="${OPT_ZONE:-${FORWARD_ZONE:-}}"
+    [ -z "$z" ] && z=$(firewall-cmd --get-default-zone 2>/dev/null)
+    [ -z "$z" ] && z=public
+    printf '%s' "$z"
+}
+
+is_local_ip() {   # $1 = IPv4
+    local x
+    for x in $(local_ips); do
+        [ "$x" = "$1" ] && return 0
+    done
+    return 1
+}
+
+installed_rules_ipt() {
+    iptq -t nat -S 2>/dev/null | awk '
+        {
+            proto = ""; lport = ""; kind = ""; dest = "";
+            for (i = 1; i <= NF; i++) {
+                if ($i == "-p" || $i == "--protocol")                proto = $(i+1);
+                else if ($i == "--dport" || $i == "--destination-port") lport = $(i+1);
+                else if ($i == "-j" || $i == "--jump")               kind  = $(i+1);
+                else if ($i == "--to-destination")                   dest  = $(i+1);
+                else if ($i == "--to-ports")                         dest  = ":" $(i+1);
+            }
+            if (proto == "" || lport == "" || kind == "" || dest == "") next;
+            if (lport ~ /^[{}]/) next;      # 端口集合暂不展开
+            if (kind == "DNAT")          print proto, lport, dest, "dnat";
+            else if (kind == "REDIRECT") print proto, lport, dest, "redirect";
+        }'
+}
+
+# 扫整份 ruleset(而不只是自己的表), 这样别的表/别的工具/旧版本留下的规则也能显示出来
+installed_rules_nft() {
+    nft list ruleset 2>/dev/null | awk '
+        {
+            for (i = 2; i <= NF; i++) {
+                if ($i != "dport") continue;
+                proto = $(i-1); lport = $(i+1);
+                if (proto !~ /^(tcp|udp|sctp|dccp)$/) continue;
+                if (lport ~ /^[{}]/) continue;
+                for (j = i + 2; j <= NF; j++) {
+                    if ($j == "dnat" && $(j+1) == "to" && $(j+2) != "")     { print proto, lport, $(j+2), "dnat";     break }
+                    if ($j == "redirect" && $(j+1) == "to" && $(j+2) != "") { print proto, lport, $(j+2), "redirect"; break }
+                }
+            }
+        }'
+}
+
+installed_rules_fw() {
+    local zone line lp proto tp ta rest
+    zone=$(fw_zone)
+    firewall-cmd --zone="$zone" --list-forward-ports 2>/dev/null | while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in port=*) ;; *) continue ;; esac
+        line="${line#port=}"
+        case "$line" in *:proto=*) ;; *) continue ;; esac
+        lp="${line%%:proto=*}"
+        rest="${line#*:proto=}"
+        proto="${rest%%:*}"
+        case "$rest" in *:toport=*) ;; *) continue ;; esac
+        rest="${rest#*:toport=}"
+        tp="${rest%%:*}"
+        ta=""
+        case "$rest" in *:toaddr=*) ta="${rest#*:toaddr=}";; esac
+        if [ -n "$ta" ]; then
+            printf '%s %s %s:%s dnat\n' "$proto" "$lp" "$ta" "$tp"
+        else
+            printf '%s %s :%s redirect\n' "$proto" "$lp" "$tp"
+        fi
+    done
+}
+
+installed_rules() {
+    local b
     b=$(current_backend)
     case "$b" in
-        iptables)
-            if [ "$NO_COMMENT" = 1 ]; then
-                iptq -t nat -S PREROUTING 2>/dev/null \
-                    | grep -qF -- "--dport $lp -j DNAT --to-destination $dip:$dp"
-            else
-                iptq -t nat -S PREROUTING 2>/dev/null | grep -q -- "$IPT_TAG:$lp:$p"
-            fi
-            return $?
-            ;;
-        nft)
-            out=$(nft list table ip "$NFT_TABLE" 2>/dev/null) || return 1
-            if [ "$(rule_mode "$dip")" = local ]; then
-                printf '%s\n' "$out" | grep -qF "$p dport $lp redirect to :$dp"
-            else
-                printf '%s\n' "$out" | grep -qF "$p dport $lp dnat to $dip:$dp"
-            fi
-            return $?
-            ;;
-        firewalld)
-            ZONE="${OPT_ZONE:-${PORTFWD_ZONE:-$(firewall-cmd --get-default-zone 2>/dev/null)}}"
-            [ -z "$ZONE" ] && ZONE=public
-            spec=$(fw_spec "$p" "$lp" "$dip" "$dp")
-            firewall-cmd --zone="$ZONE" --query-forward-port="$spec" >/dev/null 2>&1
-            return $?
-            ;;
-        *)
-            return 1
-            ;;
+        iptables)  installed_rules_ipt ;;
+        nft)       installed_rules_nft ;;
+        firewalld) installed_rules_fw ;;
+        *)         return 0 ;;
     esac
 }
 
+# 扫描所有可用后端, 输出 <backend> <proto> <lport> <dest> <kind>
+# 目的: 规则可能不是当前后端写的(切过后端 / 别的工具写的 / 旧版本留下的),
+#       只看当前后端就会"明明有规则却识别不到"。
+# 结果缓存在 RULES_ANY_CACHE 里: 列表/测试会对每条规则调一次, 不缓存的话
+# 在规则多的机器上会反复扫 nft list ruleset(可能几百毫秒一次)。
+RULES_ANY_CACHE=""
+RULES_ANY_DONE=0
+invalidate_rules_cache() { RULES_ANY_CACHE=""; RULES_ANY_DONE=0; }
+installed_rules_any() {
+    if [ "$RULES_ANY_DONE" = 1 ]; then
+        [ -n "$RULES_ANY_CACHE" ] && printf '%s\n' "$RULES_ANY_CACHE"
+        return 0
+    fi
+    RULES_ANY_CACHE=$({
+        if ipt_usable; then installed_rules_ipt | sed 's/^/iptables /'; fi
+        if cmd_exists nft; then installed_rules_nft | sed 's/^/nft /'; fi
+        if firewalld_running; then installed_rules_fw | sed 's/^/firewalld /'; fi
+    } | awk 'NF == 5 && !seen[$2" "$3" "$4" "$5]++')
+    RULES_ANY_DONE=1
+    [ -n "$RULES_ANY_CACHE" ] && printf '%s\n' "$RULES_ANY_CACHE"
+    return 0
+}
+
+# 配置里是否有这条(供"仅内核"标记使用); $4 可以是 * 表示任意目标端口
+rule_in_conf() {   # proto lport dip dport
+    local p lp dip dp m
+    while read -r p lp dip dp m; do
+        [ "$p" = "$1" ] && [ "$lp" = "$2" ] && [ "$dip" = "$3" ] || continue
+        { [ "$4" = "*" ] || [ "$4" = "$dp" ]; } && return 0
+    done < <(norm_rules)
+    return 1
+}
+
+check_rule_installed() {   # proto lport dip dport
+    local wp="$1" wl="$2" wdip="$3" wdp="$4" bk p lp dest kind dip dp
+    while read -r bk p lp dest kind; do
+        [ "$p" = "$wp" ] && [ "$lp" = "$wl" ] || continue
+        case "$dest" in
+            *:*) dip="${dest%:*}"; dp="${dest##*:}" ;;
+            *)   dip="$dest";      dp="$wl" ;;
+        esac
+        [ -z "$dip" ] && dip="127.0.0.1"
+        [ "$dp" = "$wdp" ] || continue
+        case "$kind" in
+            dnat)
+                [ "$dip" = "$wdip" ] && return 0
+                # 目标写成本机网卡地址的 DNAT, 与 REDIRECT 等效
+                if { [ "$wdip" = "127.0.0.1" ] || [ "$wdip" = "0.0.0.0" ]; } && is_local_ip "$dip"; then
+                    return 0
+                fi
+                ;;
+            redirect)
+                if [ "$wdip" = "127.0.0.1" ] || [ "$wdip" = "0.0.0.0" ]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done < <(installed_rules_any)
+    return 1
+}
+
 do_list() {
-    local p lp dip dp m mode state n=0
-    local b
+    local p lp dip dp m mode state n=0 b total=0 extra=0
+    invalidate_rules_cache
+    if [ "$(id -u 2>/dev/null || echo 0)" != 0 ]; then
+        warn "当前不是 root, 可能读不到内核里的防火墙规则; 请用 sudo 运行"
+    fi
     b=$(current_backend)
     if [ "$RAW" = 1 ]; then
         while read -r p lp dip dp m; do
@@ -1087,30 +1468,94 @@ do_list() {
         done < <(norm_rules)
         return 0
     fi
+
     if [ "$(count_rules)" -eq 0 ]; then
-        info "当前没有转发规则 (配置文件: $RULES_FILE)"
+        info "配置文件里没有转发规则 ($RULES_FILE)"
+    else
+        printf '%-6s %-7s %-17s %-7s %-6s %s\n' "PROTO" "LPORT" "DEST_IP" "DPORT" "SNAT" "STATE"
+        while read -r p lp dip dp m; do
+            n=$((n + 1))
+            mode=$(rule_mode "$dip")
+            if check_rule_installed "$p" "$lp" "$dip" "$dp"; then
+                state="${C_GRN}已生效${C_RST}"
+            else
+                state="${C_YEL}未生效${C_RST}"
+            fi
+            printf '%-6s %-7s %-17s %-7s %-6s %b' "$p" "$lp" "$dip" "$dp" \
+                "$([ "$m" = 1 ] && echo yes || echo no)" "$state"
+            [ "$mode" = local ] && printf ' (本机)'
+            printf '\n'
+        done < <(norm_rules)
+        printf '%s共 %d 条配置规则, 后端: %s%s\n' "$C_DIM" "$n" "${b:-未探测到}" "$C_RST"
+    fi
+
+    printf '\n%s内核里实际生效的转发规则:%s\n' "$C_DIM" "$C_RST"
+    while read -r bk p lp dest kind; do
+        total=$((total + 1))
+        case "$dest" in
+            *:*) dip="${dest%:*}"; dp="${dest##*:}" ;;
+            *)   dip="$dest";      dp="*" ;;
+        esac
+        [ -z "$dip" ] && dip="127.0.0.1"
+        if rule_in_conf "$p" "$lp" "$dip" "$dp"; then
+            state="${C_GRN}在配置中${C_RST}"
+        else
+            state="${C_YEL}不在配置中${C_RST}"
+            extra=$((extra + 1))
+        fi
+        [ "$bk" != "${b:-}" ] && state="$state ${C_DIM}($bk 写入)${C_RST}"
+        printf '  %-4s %-6s -> %-17s %-6s %-8s %b\n' "$p" "$lp" "$dip" "$dp" "$kind" "$state"
+    done < <(installed_rules_any)
+
+    if [ "$total" -eq 0 ]; then
+        info "  (没有读到任何生效规则)"
+        if [ -z "$b" ]; then
+            warn "  没有可用的转发后端, 请先看: $PROG status"
+        else
+            warn "  当前后端是 $b, 若你确信规则已存在, 请执行: $PROG doctor"
+        fi
+    elif [ "$extra" -gt 0 ]; then
+        info "  其中 $extra 条不在配置文件里(手工或其它工具所加)。"
+        info "  想让本工具接管开机自动恢复, 请重新用 '$PROG add ...' 添加一次。"
+    fi
+}
+
+# 把内核里已经生效、但配置文件里没有的规则"收编"进 rules.conf,
+# 这样它们才会被开机自启统一恢复。
+do_import() {
+    need_root
+    ensure_conf_dir
+    invalidate_rules_cache
+    local bk p lp dest kind dip dp masq n=0
+    while read -r bk p lp dest kind; do
+        case "$dest" in
+            *:*) dip="${dest%:*}"; dp="${dest##*:}" ;;
+            *)   dip="$dest";      dp="$lp" ;;
+        esac
+        if [ "$kind" = "redirect" ] || [ "$dip" = "0.0.0.0" ]; then dip="127.0.0.1"; fi
+        [ -n "$dip" ] || dip="127.0.0.1"
+        if ! valid_ipv4 "$dip" || ! valid_port "$dp"; then
+            warn "跳过无法解析的规则: $p $lp -> $dest ($kind)"
+            continue
+        fi
+        rule_in_conf "$p" "$lp" "$dip" "$dp" && continue
+        masq=0
+        if [ "$dip" != "127.0.0.1" ] && ! is_local_ip "$dip"; then masq=1; fi
+        rule_add "$p" "$lp" "$dip" "$dp" "$masq"
+        info "收编: $p $lp -> $dip:$dp"
+        n=$((n + 1))
+    done < <(installed_rules_any)
+
+    if [ "$n" -eq 0 ]; then
+        info "没有需要收编的规则(内核里的规则都已在 $RULES_FILE 中)"
         return 0
     fi
-    printf '%-6s %-7s %-17s %-7s %-6s %s\n' "PROTO" "LPORT" "DEST_IP" "DPORT" "SNAT" "STATE"
-    while read -r p lp dip dp m; do
-        n=$((n + 1))
-        mode=$(rule_mode "$dip")
-        if check_rule_installed "$p" "$lp" "$dip" "$dp"; then
-            state="${C_GRN}已生效${C_RST}"
-        else
-            state="${C_YEL}未生效${C_RST}"
-        fi
-        printf '%-6s %-7s %-17s %-7s %-6s %b' "$p" "$lp" "$dip" "$dp" \
-            "$([ "$m" = 1 ] && echo yes || echo no)" "$state"
-        [ "$mode" = local ] && printf ' (本机)'
-        printf '\n'
-    done < <(norm_rules)
-    printf '%s共 %d 条规则, 后端: %s%s\n' "$C_DIM" "$n" "${b:-未探测到}" "$C_RST"
+    info "已收编 $n 条规则到 $RULES_FILE"
+    info "执行 '$PROG apply' 后由本工具统一管理, 开机自动恢复。"
 }
 
 # TCP 端口连通性探测 (UDP 返回 2 表示无法可靠探测)
-port_open() {
-    local h="$1" pt="$2" pr="${3:-tcp}" have_nc_z=0
+port_open() {    local h="$1" pt="$2" pr="${3:-tcp}" have_nc_z=0
     if [ "$pr" != tcp ]; then
         return 2
     fi
@@ -1141,6 +1586,7 @@ do_test() {
         return 0
     fi
     need_root
+    invalidate_rules_cache
     resolve_backend >/dev/null 2>&1 || true
     while read -r p lp dip dp m; do
         if [ -n "$only" ] && [ "$only" != "$lp" ]; then
@@ -1178,6 +1624,7 @@ do_test() {
 
 do_status() {
     local b avail_ipt avail_nft avail_fw ipfwd n persist z init
+    invalidate_rules_cache
     init=$(init_system)
     b=$(current_backend)
     avail_ipt="否"; ipt_usable && avail_ipt="是"
@@ -1249,15 +1696,15 @@ persist_enabled() {
     case "$init" in
         systemd)
             [ -f "$SYSTEMD_UNIT" ] || return 1
-            systemctl is-enabled portfwd.service >/dev/null 2>&1
+            systemctl is-enabled forward.service >/dev/null 2>&1
             ;;
         openrc)
             [ -x "$INIT_SCRIPT" ] || return 1
-            rc-update show default 2>/dev/null | grep -q portfwd
+            rc-update show default 2>/dev/null | grep -q forward
             ;;
         sysvinit)
             local rl
-            for rl in /etc/rc2.d/S??portfwd /etc/rc3.d/S??portfwd /etc/rc.d/rc3.d/S??portfwd; do
+            for rl in /etc/rc2.d/S??forward /etc/rc3.d/S??forward /etc/rc.d/rc3.d/S??forward; do
                 [ -e "$rl" ] && return 0
             done
             return 1
@@ -1272,7 +1719,7 @@ write_systemd_unit() {
     mkdir -p "$(dirname "$SYSTEMD_UNIT")" 2>/dev/null || return 1
     cat > "$SYSTEMD_UNIT" <<EOF
 [Unit]
-Description=portfwd 端口转发规则恢复
+Description=forward 端口转发规则恢复
 After=network-online.target nftables.service iptables.service netfilter-persistent.service firewalld.service docker.service
 Wants=network-online.target
 ConditionPathExists=$RULES_FILE
@@ -1292,22 +1739,23 @@ EOF
 write_openrc_script() {
     cat > "$INIT_SCRIPT" <<EOF
 #!/sbin/openrc-run
-# 由 portfwd 生成
-description="portfwd 端口转发规则恢复"
+# 由 forward 生成
+description="forward 端口转发规则恢复"
 
 depend() {
-    need localmount net
+    need localmount
+    use net
     after nftables iptables firewall
 }
 
 start() {
-    ebegin "应用 portfwd 转发规则"
+    ebegin "应用 forward 转发规则"
     $SELF_BIN apply --quiet
     eend \$?
 }
 
 stop() {
-    ebegin "portfwd 规则由防火墙自身管理, 停止时不做清理"
+    ebegin "forward 规则由防火墙自身管理, 停止时不做清理"
     eend 0
 }
 EOF
@@ -1318,14 +1766,14 @@ write_sysv_script() {
     cat > "$INIT_SCRIPT" <<EOF
 #!/bin/sh
 # chkconfig: 2345 90 10
-# description: 按 $RULES_FILE 恢复端口转发规则(portfwd)
+# description: 按 $RULES_FILE 恢复端口转发规则(forward)
 ### BEGIN INIT INFO
-# Provides:          portfwd
+# Provides:          forward
 # Required-Start:    \$local_fs \$network
 # Required-Stop:     \$local_fs
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: portfwd 端口转发规则恢复
+# Short-Description: forward 端口转发规则恢复
 # Description:       启动时按 $RULES_FILE 恢复端口转发规则
 ### END INIT INFO
 case "\$1" in
@@ -1343,11 +1791,12 @@ EOF
 persist_install() {
     need_root
     ensure_conf_dir
+    legacy_migrate || true
     local src init
     src=$(self_path)
     if [ ! -f "$src" ] || [ ! -r "$src" ]; then
         err "无法定位脚本本体($src); 请先把脚本保存成文件再执行 install"
-        err "  例如: curl -o portfwd.sh <地址> && sudo bash portfwd.sh install"
+        err "  例如: curl -o forward.sh <地址> && sudo bash forward.sh install"
         return 1
     fi
     # 1) 安装自身到固定路径(服务要用)
@@ -1378,34 +1827,34 @@ persist_install() {
         systemd)
             if [ "$DRY_RUN" = 1 ]; then
                 printf '  [dry-run] 写入 %s\n' "$SYSTEMD_UNIT"
-                printf '  [dry-run] systemctl daemon-reload; systemctl enable --now portfwd.service\n'
+                printf '  [dry-run] systemctl daemon-reload; systemctl enable --now forward.service\n'
             else
                 write_systemd_unit || { err "写入 $SYSTEMD_UNIT 失败"; return 1; }
                 systemctl daemon-reload >/dev/null 2>&1 || true
-                systemctl enable portfwd.service >/dev/null 2>&1 \
+                systemctl enable forward.service >/dev/null 2>&1 \
                     || warn "systemctl enable 失败(容器环境可忽略)"
-                systemctl restart portfwd.service >/dev/null 2>&1 \
-                    || warn "systemctl start 失败, 用 journalctl -u portfwd 查看原因"
+                systemctl restart forward.service >/dev/null 2>&1 \
+                    || warn "systemctl start 失败, 用 journalctl -u forward 查看原因"
             fi
             ;;
         openrc)
             if [ "$DRY_RUN" = 1 ]; then
-                printf '  [dry-run] 写入 %s; rc-update add portfwd default\n' "$INIT_SCRIPT"
+                printf '  [dry-run] 写入 %s; rc-update add forward default\n' "$INIT_SCRIPT"
             else
                 write_openrc_script
-                rc-update add portfwd default >/dev/null 2>&1 || warn "rc-update add 失败"
-                rc-service portfwd start >/dev/null 2>&1 || true
+                rc-update add forward default >/dev/null 2>&1 || warn "rc-update add 失败"
+                rc-service forward start >/dev/null 2>&1 || true
             fi
             ;;
         sysvinit)
             if [ "$DRY_RUN" = 1 ]; then
-                printf '  [dry-run] 写入 %s; update-rc.d portfwd defaults\n' "$INIT_SCRIPT"
+                printf '  [dry-run] 写入 %s; update-rc.d forward defaults\n' "$INIT_SCRIPT"
             else
                 write_sysv_script
                 if cmd_exists update-rc.d; then
-                    update-rc.d portfwd defaults >/dev/null 2>&1 || warn "update-rc.d 失败"
+                    update-rc.d forward defaults >/dev/null 2>&1 || warn "update-rc.d 失败"
                 elif cmd_exists chkconfig; then
-                    chkconfig --add portfwd >/dev/null 2>&1 || warn "chkconfig 失败"
+                    chkconfig --add forward >/dev/null 2>&1 || warn "chkconfig 失败"
                 fi
             fi
             ;;
@@ -1425,19 +1874,19 @@ persist_remove() {
     case "$init" in
         systemd)
             if [ "$DRY_RUN" = 1 ]; then
-                printf '  [dry-run] systemctl disable --now portfwd.service; rm -f %s\n' "$SYSTEMD_UNIT"
+                printf '  [dry-run] systemctl disable --now forward.service; rm -f %s\n' "$SYSTEMD_UNIT"
             else
-                systemctl disable --now portfwd.service >/dev/null 2>&1 || true
+                systemctl disable --now forward.service >/dev/null 2>&1 || true
                 rm -f "$SYSTEMD_UNIT"
                 systemctl daemon-reload >/dev/null 2>&1 || true
             fi
             ;;
         openrc)
             if [ "$DRY_RUN" = 1 ]; then
-                printf '  [dry-run] rc-update del portfwd default; rm -f %s\n' "$INIT_SCRIPT"
+                printf '  [dry-run] rc-update del forward default; rm -f %s\n' "$INIT_SCRIPT"
             else
-                rc-update del portfwd default >/dev/null 2>&1 || true
-                rc-service portfwd stop >/dev/null 2>&1 || true
+                rc-update del forward default >/dev/null 2>&1 || true
+                rc-service forward stop >/dev/null 2>&1 || true
                 rm -f "$INIT_SCRIPT"
             fi
             ;;
@@ -1446,9 +1895,9 @@ persist_remove() {
                 printf '  [dry-run] 移除 %s\n' "$INIT_SCRIPT"
             else
                 if cmd_exists update-rc.d; then
-                    update-rc.d -f portfwd remove >/dev/null 2>&1 || true
+                    update-rc.d -f forward remove >/dev/null 2>&1 || true
                 elif cmd_exists chkconfig; then
-                    chkconfig --del portfwd >/dev/null 2>&1 || true
+                    chkconfig --del forward >/dev/null 2>&1 || true
                 fi
                 rm -f "$INIT_SCRIPT"
             fi
@@ -1690,6 +2139,8 @@ ${PROG} ${VERSION} - Linux 端口转发管理工具 (iptables / nftables / firew
   test       测试转发            test [监听端口]
   status     查看运行状态        status [--raw]
   backend    查看/切换后端       backend [auto|iptables|nft|firewalld]
+  doctor     诊断: 打印后端原始规则(规则"识别不到"时用)
+  import     收编内核里已有、但配置里没有的规则到 rules.conf
   install    安装开机自启        install
   uninstall  卸载开机自启        uninstall
   menu       交互菜单
@@ -1723,7 +2174,7 @@ ${PROG} ${VERSION} - Linux 端口转发管理工具 (iptables / nftables / firew
   ${PROG} install                                      # 重启后自动恢复
 
 说明:
-  * 只增删自己带注释标记的 iptables 规则 / 自己的 nft 表(ip portfwd),
+  * 只增删自己带注释标记的 iptables 规则 / 自己的 nft 表(ip forward),
     不会清空整张 nat 表, 不影响 Docker、ufw、Kubernetes。
   * 从本机连接 127.0.0.1:<入口端口> 不经过 PREROUTING, 无法验证 DNAT,
     请从其它机器测试。
@@ -1890,6 +2341,8 @@ main() {
         test)       do_test "${POSITIONAL[1]:-}" ;;
         status|info) do_status ;;
         backend)    cmd_backend "${POSITIONAL[1]:-}" ;;
+        doctor|diag) do_doctor ;;
+        import|adopt) do_import ;;
         install)    cmd_install ;;
         uninstall)  cmd_uninstall ;;
         menu)       main_menu ;;
