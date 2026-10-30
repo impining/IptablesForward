@@ -650,16 +650,16 @@ nft_hook_chains() {   # $1 = forward|input
     printf '%s\n' "$out" | awk -v hook="$1" '
         /^table / {
             fam = $2; tbl = $3
-            sub(/[ \t]*\{[ \t]*$/, "", tbl)
+            sub(/[[:space:]]*\{[[:space:]]*$/, "", tbl)
             chain = ""
             next
         }
-        /^[ \t]+chain / {
+        /^[[:space:]]+chain / {
             chain = $2
-            sub(/[ \t]*\{[ \t]*$/, "", chain)
+            sub(/[[:space:]]*\{[[:space:]]*$/, "", chain)
             next
         }
-        /^[ \t]+type .*hook / {
+        /^[[:space:]]+type .*hook / {
             if (chain != "" && index($0, "hook " hook " ") > 0) {
                 if (fam == "ip" || fam == "inet") print fam, tbl, chain
             }
@@ -1560,19 +1560,19 @@ located_nft() {
     nft -a list ruleset 2>/dev/null | awk -v own_tbl="$NFT_TABLE" '
         /^table / {
             fam = $2; tbl = $3
-            sub(/[ \t]*\{.*$/, "", tbl)
+            sub(/[[:space:]]*\{.*$/, "", tbl)
             chain = ""
             next
         }
-        /^[ \t]+chain / {
+        /^[[:space:]]+chain / {
             chain = $2
-            sub(/[ \t]*\{.*$/, "", chain)
+            sub(/[[:space:]]*\{.*$/, "", chain)
             next
         }
         {
             if (fam == "" || tbl == "" || chain == "") next
             h = ""
-            if ($(NF-2) == "#" && $(NF-1) == "handle" && $NF ~ /^[0-9]+$/) h = $NF
+            if (NF >= 3 && $(NF-2) == "#" && $(NF-1) == "handle" && $NF ~ /^[0-9]+$/) h = $NF
             kind = ""; dest = ""
             for (i = 2; i <= NF; i++) {
                 if ($i != "dport") continue
