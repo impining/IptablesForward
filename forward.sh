@@ -61,6 +61,8 @@ OPT_LISTEN=""       # add: 监听端口
 OPT_DEST=""         # add: 目标地址
 OPT_DPORT=""        # add: 目标端口
 OPT_MASQ=""         # add: 是否 SNAT(1/0)
+OPT_KEEP_RULES=0    # uninstall: 不清理内核里已生效的规则
+OPT_PURGE=0         # uninstall: 连 /etc/forward 配置一起删
 
 BACKEND=""          # 解析后的后端
 ZONE=""             # firewalld 区域
@@ -1276,6 +1278,27 @@ do_apply() {
     return "$rc"
 }
 
+# 只清理防火墙里的转发规则, 不动规则配置文件(卸载时用)
+# 没有可用后端时置 CLEAR_SKIPPED=1, 由调用方决定如何提示
+CLEAR_SKIPPED=0
+clear_firewall_rules() {
+    local b rc=0
+    CLEAR_SKIPPED=0
+    b=$(current_backend)
+    case "$b" in
+        iptables)  ipt_clear  || rc=1 ;;
+        nft)       nft_clear  || rc=1 ;;
+        firewalld) fw_clear   || rc=1 ;;
+        *) warn "未探测到可用后端, 跳过清理内核规则"; CLEAR_SKIPPED=1; return 0 ;;
+    esac
+    if [ "$DRY_RUN" != 1 ] && [ "$rc" = 0 ]; then
+        ensure_conf_dir
+        : > "$APPLIED_FILE"
+    fi
+    invalidate_rules_cache
+    return "$rc"
+}
+
 do_clear() {
     need_root
     ensure_conf_dir
@@ -1647,6 +1670,7 @@ do_status() {
         printf 'rules=%s\n' "$n"
         printf 'rules_file=%s\n' "$RULES_FILE"
         printf 'persist=%s\n' "$(persist_enabled && printf yes || printf no)"
+        printf 'self_bin=%s\n' "$([ -e "$SELF_BIN" ] && printf installed || printf missing)"
         return 0
     fi
 
@@ -1666,6 +1690,17 @@ do_status() {
     log "  ip_forward    : $ipfwd $([ "$ipfwd" = 1 ] && printf "(${C_GRN}已开启${C_RST})" || printf "(${C_YEL}未开启${C_RST})")"
     log "  规则数量      : $n"
     log "  开机自启      : $(persist_enabled && printf "已启用 (${init})" || printf "未启用")"
+    if [ -e "$SELF_BIN" ]; then
+        log "  程序本体      : $SELF_BIN (已安装)"
+    else
+        local pth
+        pth=$(command -v forward 2>/dev/null || true)
+        if [ -n "$pth" ] && [ "$pth" != "$SELF_BIN" ]; then
+            log "  程序本体      : 未安装(当前 PATH 里是 $pth, 非本工具安装)"
+        else
+            log "  程序本体      : 未安装(仅能直接运行脚本文件)"
+        fi
+    fi
     log "  配置文件      : $RULES_FILE"
     log "  已应用快照    : $APPLIED_FILE"
     log "  sysctl 文件   : $SYSCTL_FILE"
@@ -2142,7 +2177,7 @@ ${PROG} ${VERSION} - Linux 端口转发管理工具 (iptables / nftables / firew
   doctor     诊断: 打印后端原始规则(规则"识别不到"时用)
   import     收编内核里已有、但配置里没有的规则到 rules.conf
   install    安装开机自启        install
-  uninstall  卸载开机自启        uninstall
+  uninstall  卸载(自启+程序+规则) uninstall [--keep-rules] [--purge]
   menu       交互菜单
 
 选项:
@@ -2157,6 +2192,8 @@ ${PROG} ${VERSION} - Linux 端口转发管理工具 (iptables / nftables / firew
   -y, --yes                所有确认自动回答 yes
   -n, --dry-run            只打印将执行的命令, 不改动系统
       --raw                机器可读输出
+      --keep-rules         卸载时保留已下发的规则(默认会清理)
+      --purge              卸载时连配置目录一起删除
       --no-color           禁用颜色
   -h, --help               显示帮助
   -V, --version            显示版本
@@ -2267,15 +2304,105 @@ cmd_install() {
 
 cmd_uninstall() {
     need_root
-    if ! confirm "确认卸载开机自启(规则保留)? [y/N] "; then
+    local init p bin_state rule_state conf_state
+    init=$(init_system)
+
+    if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then
+        log "将要执行:"
+        log "  1) 移除开机自启 ($init)"
+        log "  2) 删除程序本体 $SELF_BIN"
+        if [ "$OPT_KEEP_RULES" = 1 ]; then
+            log "  3) 保留已下发的转发规则 (--keep-rules), 但重启后不会再恢复"
+        else
+            log "  3) 清理已下发的转发规则"
+        fi
+        if [ "$OPT_PURGE" = 1 ]; then
+            log "  4) 删除配置目录 $CONF_DIR"
+        else
+            log "  4) 保留配置 $RULES_FILE (重装后 apply 即可恢复)"
+        fi
+    fi
+    if ! confirm "确认卸载? [y/N] "; then
         info "已取消"
         return 0
     fi
-    persist_remove || return 1
-    if [ -f "$SELF_BIN" ] && [ "$SELF_BIN" != "$(self_path)" ]; then
-        rm -f "$SELF_BIN" && info "已删除 $SELF_BIN"
+
+    persist_remove || warn "移除开机自启时出错, 继续"
+
+    if [ "$OPT_KEEP_RULES" != 1 ]; then
+        if clear_firewall_rules; then
+            if [ "$CLEAR_SKIPPED" = 1 ]; then
+                rule_state="未清理(没有可用的防火墙后端)"
+            else
+                rule_state="已清理"
+            fi
+        else
+            rule_state="清理出错, 请用 list 核对"
+        fi
+    else
+        rule_state="保留(重启后不再自动恢复)"
     fi
-    ok "卸载完成, 规则仍在 $( [ -f "$RULES_FILE" ] && echo "$RULES_FILE" )"
+
+    # 即使当前正运行的就是 $SELF_BIN, Linux 也允许 unlink 正在执行的脚本文件
+    if [ -e "$SELF_BIN" ] || [ -h "$SELF_BIN" ]; then
+        if [ "$DRY_RUN" = 1 ]; then
+            printf '  [dry-run] rm -f %s\n' "$SELF_BIN"
+            bin_state="(dry-run 未删除)"
+        elif rm -f -- "$SELF_BIN" 2>/dev/null; then
+            info "已删除程序本体 $SELF_BIN"
+            bin_state="已删除"
+        else
+            warn "删除 $SELF_BIN 失败(权限不足?)"
+            bin_state="仍存在"
+        fi
+    else
+        bin_state="不存在"
+    fi
+    hash -r 2>/dev/null || true
+
+    # PATH 里还有别的同名命令时, 用户会以为"没卸载干净"/"forward 还能用"
+    p=$(command -v forward 2>/dev/null || true)
+    if [ -n "$p" ] && [ "$p" != "$SELF_BIN" ] && [ -f "$p" ]; then
+        warn "PATH 中还有另一个 forward: $p"
+        warn "  它不是本工具安装的(可能是别的软件或手工拷贝), 输入 forward 会启动它; 如不需要请自行删除"
+    fi
+
+    if [ "$OPT_PURGE" = 1 ]; then
+        # 只删我们自己的配置目录; 明显危险或非绝对路径的一律拒绝
+        case "$CONF_DIR" in
+            ""|/|/etc|/usr|/usr/local|/usr/local/etc|/var|/root|/home)
+                err "配置目录看起来是系统目录, 拒绝自动删除: $CONF_DIR"
+                conf_state="保留"
+                ;;
+            /*/*)
+                if [ "$DRY_RUN" = 1 ]; then
+                    printf '  [dry-run] rm -rf %s\n' "$CONF_DIR"
+                    conf_state="(dry-run 未删除)"
+                else
+                    rm -rf -- "$CONF_DIR" && conf_state="已删除" || { warn "删除 $CONF_DIR 失败"; conf_state="仍存在"; }
+                fi
+                ;;
+            *)
+                err "配置目录不是绝对路径, 拒绝自动删除: $CONF_DIR"
+                conf_state="保留"
+                ;;
+        esac
+    else
+        conf_state="$([ -f "$RULES_FILE" ] && echo "保留 $RULES_FILE" || echo "无")"
+    fi
+
+    log ""
+    ok "卸载完成"
+    log "  开机自启 : 已移除"
+    log "  程序本体 : $bin_state"
+    log "  内核规则 : $rule_state"
+    log "  配置文件 : $conf_state"
+    if [ "$OPT_PURGE" != 1 ] && [ -f "$RULES_FILE" ]; then
+        log ""
+        log "  注意: 开机自启已移除, 重启后规则不会自动恢复(内核规则本身不跨重启)。"
+        log "        需要再次使用时, 用原脚本重新安装: sudo bash forward.sh install"
+    fi
+    return 0
 }
 
 #-------------------------------------------------------------------------------
@@ -2294,6 +2421,8 @@ parse_args() {
             --raw)        RAW=1 ;;
             --no-color)   NO_COLOR_OPT=1 ;;
             --masq)       OPT_MASQ=1 ;;
+            --keep-rules) OPT_KEEP_RULES=1 ;;
+            --purge)      OPT_PURGE=1 ;;
             --backend)    shift; OPT_BACKEND="${1:-}"; [ -n "$OPT_BACKEND" ] || die "--backend 需要参数" ;;
             --backend=*)  OPT_BACKEND="${arg#*=}" ;;
             --zone)       shift; OPT_ZONE="${1:-}" ;;
