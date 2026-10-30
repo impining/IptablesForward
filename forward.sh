@@ -61,7 +61,8 @@ OPT_LISTEN=""       # add: 监听端口
 OPT_DEST=""         # add: 目标地址
 OPT_DPORT=""        # add: 目标端口
 OPT_MASQ=""         # add: 是否 SNAT(1/0)
-OPT_KEEP_RULES=0    # uninstall: 不清理内核里已生效的规则
+OPT_CLEAR_RULES=0   # uninstall: 1 = 连内核里已生效的规则一起清 (--clear-rules)
+OPT_ALL=0           # clear: 1 = 连不是本工具写入的规则一起清 (--all)
 OPT_PURGE=0         # uninstall: 连 /etc/forward 配置一起删
 
 BACKEND=""          # 解析后的后端
@@ -1299,29 +1300,104 @@ clear_firewall_rules() {
     return "$rc"
 }
 
+# 清空转发规则
+#   默认只清"本工具下发/配置里有的", 别人的规则一条不动;
+#   --all 时连内核里扫描到的其它来源的 DNAT/REDIRECT 一起删(需要再确认一次)。
 do_clear() {
     need_root
     ensure_conf_dir
-    if [ "$ASSUME_YES" != 1 ]; then
-        confirm "确认清空所有端口转发规则(可按快照恢复)? [y/N] " || { info "已取消"; return 0; }
+    invalidate_rules_cache
+    local loc own_n ext_n ext_list choice
+    loc=$(installed_located)
+    own_n=$(printf '%s\n' "$loc" | awk -F'|' 'NF >= 7 && $6 == 1' | grep -c . || true)
+    ext_list=$(printf '%s\n' "$loc" | awk -F'|' 'NF >= 7 && $6 == 0')
+    ext_n=$(printf '%s\n' "$ext_list" | grep -c . || true)
+
+    if [ "$RAW" != 1 ] && [ "${own_n:-0}" -gt 0 -o "${ext_n:-0}" -gt 0 ]; then
+        printf '\n  扫描到的转发规则:\n'
+        printf '    本工具写入/在配置中: %s 条\n' "${own_n:-0}"
+        printf '    其它来源(手工/别的工具): %s 条\n' "${ext_n:-0}"
+        if [ "${ext_n:-0}" -gt 0 ]; then
+            printf '%s' "$ext_list" | awk -F'|' '{ printf "      %-8s %-5s %-6s -> %-20s %s\n", $1, $2, $3, $4, $5 }'
+        fi
+        printf '\n'
     fi
-    local b
-    b=$(current_backend)
-    case "$b" in
-        iptables)  ipt_clear  ;;
-        nft)       nft_clear  ;;
-        firewalld) fw_clear   ;;
-        *) warn "未探测到可用后端, 仅清空配置文件" ;;
+
+    if [ "$ASSUME_YES" = 1 ]; then
+        choice=1
+        [ "$OPT_ALL" = 1 ] && choice=2
+    else
+        printf '  清空方式:\n'
+        printf '    1) 只清本工具的规则(保留其它来源)   [默认]\n'
+        printf '    2) 连其它来源的规则一起清(会删别人的 DNAT/REDIRECT)\n'
+        printf '    3) 取消\n'
+        read -r -p '  请选择 [1-3]: ' choice || choice=3
+    fi
+
+    case "${choice:-3}" in
+        1) ;;
+        2)  if [ "$ASSUME_YES" != 1 ]; then
+                if [ "${ext_n:-0}" -eq 0 ]; then
+                    info "没有发现其它来源的规则, 按方式 1 处理"
+                else
+                    confirm "确认连 ${ext_n} 条外部规则一起删除? 这会改动不是本工具写的防火墙规则 [y/N] " \
+                        || { info "已取消"; return 0; }
+                fi
+            fi
+            ;;
+        *) info "已取消"; return 0 ;;
     esac
+
+    clear_own_rules || true
+
+    if [ "${choice:-3}" = 2 ] && [ "${ext_n:-0}" -gt 0 ]; then
+        clear_external_rules || true
+        if firewalld_running; then firewall-cmd --reload >/dev/null 2>&1 || true; fi
+    fi
+
     backup_rules
     if [ "$DRY_RUN" != 1 ]; then
         ensure_conf_dir
         : > "$RULES_FILE"
         : > "$APPLIED_FILE"
     fi
-    ok "已清空所有转发规则"
+    ok "已清空转发规则"
     invalidate_rules_cache
     return 0
+}
+
+# 清掉本工具在所有后端留下的规则(不看当前后端, 因为可能来回切过)
+clear_own_rules() {
+    local rc=0
+    if ipt_usable; then ipt_clear || rc=1; fi
+    if cmd_exists nft; then
+        nft_clear >/dev/null 2>&1 || true
+        nft_clear_hooks >/dev/null 2>&1 || true
+    fi
+    if firewalld_running; then fw_clear || rc=1; fi
+    return "$rc"
+}
+
+# 删掉扫描到的"非本工具"规则(--all 时用)
+clear_external_rules() {
+    local bk p lp dest kind own loc n=0 rc=0
+    while IFS='|' read -r bk p lp dest kind own loc; do
+        [ -z "${bk:-}" ] && continue
+        [ "$own" = 1 ] && continue
+        if [ "$DRY_RUN" = 1 ]; then
+            printf '  [dry-run] 删除外部规则: %s %s -> %s (%s, %s)\n' "$p" "$lp" "$dest" "$kind" "$bk"
+            continue
+        fi
+        if delete_located "$bk" "$p" "$lp" "$dest" "$kind" "$loc"; then
+            info "已删除外部规则: $p $lp -> $dest ($bk)"
+            n=$((n + 1))
+        else
+            warn "删除失败: $p $lp -> $dest ($bk)"
+            rc=1
+        fi
+    done < <(installed_located | awk -F'|' 'NF >= 7 && $6 == 0')
+    [ "$n" -eq 0 ] && [ "$DRY_RUN" != 1 ] && info "没有删除任何外部规则"
+    return "$rc"
 }
 
 #-------------------------------------------------------------------------------
@@ -1417,27 +1493,228 @@ installed_rules() {
     esac
 }
 
+#-------------------------------------------------------------------------------
+# 可定位(可删除)的规则枚举
+#   输出: <backend>|<proto>|<lport>|<dest>|<kind>|<own>|<locator>
+#     own=1 : 带本工具标记(iptables 注释 / nft 自己的表)或本工具配置里就有
+#     locator:
+#       iptables  -> nat|CHAIN     (删除时按 proto/lport/kind/dest 在该链里找)
+#       nft       -> fam|table|chain|handle
+#       firewalld -> port=..:proto=..:toport=..[:toaddr=..]
+#   为了能"清空/测试"别人写的规则, 这里刻意不区分来源, 一律枚举出来。
+#-------------------------------------------------------------------------------
+
+# 按 shell 引号规则切词: iptables -S 的输出里注释是带引号的, 直接 $* 拆会被空格拆散
+# (以前就踩过: --comment "portfwd: old" -> 参数变成两个, 报 Bad argument `old')
+split_argv() {
+    SPLIT_ARGV=()
+    local s="$1" n=${#1} i c tok="" inq=""
+    for ((i = 0; i < n; i++)); do
+        c=${s:i:1}
+        if [ -z "$inq" ]; then
+            case "$c" in
+                ' '|$'\t')
+                    if [ -n "$tok" ]; then SPLIT_ARGV+=("$tok"); tok=""; fi
+                    ;;
+                '"'|"'") inq="$c" ;;
+                *) tok="$tok$c" ;;
+            esac
+        else
+            if [ "$c" = "$inq" ]; then inq=""; else tok="$tok$c"; fi
+        fi
+    done
+    [ -n "$tok" ] && SPLIT_ARGV+=("$tok")
+    return 0
+}
+
+located_ipt() {
+    local ch line p lp kind dest own i
+    for ch in PREROUTING OUTPUT POSTROUTING; do
+        while IFS= read -r line; do
+            case "$line" in "-A $ch "*) ;; *) continue ;; esac
+            case "$line" in *DNAT*|*REDIRECT*) ;; *) continue ;; esac
+            split_argv "$line"
+            p=""; lp=""; kind=""; dest=""
+            for ((i = 0; i < ${#SPLIT_ARGV[@]}; i++)); do
+                case "${SPLIT_ARGV[i]}" in
+                    -p|--protocol)              p="${SPLIT_ARGV[i+1]:-}" ;;
+                    --dport|--destination-port) lp="${SPLIT_ARGV[i+1]:-}" ;;
+                    -j|--jump)                  kind="${SPLIT_ARGV[i+1]:-}" ;;
+                    --to-destination)           dest="${SPLIT_ARGV[i+1]:-}" ;;
+                    --to-ports)                 dest=":${SPLIT_ARGV[i+1]:-}" ;;
+                esac
+            done
+            [ -n "$p" ] && [ -n "$lp" ] && [ -n "$kind" ] && [ -n "$dest" ] || continue
+            case "$lp" in ''|*[!0-9]*) continue ;; esac
+            own=0
+            case "$line" in *"${IPT_TAG}:"*) own=1 ;; esac
+            case "$kind" in
+                DNAT)     printf 'iptables|%s|%s|%s|dnat|%s|nat|%s\n' "$p" "$lp" "$dest" "$own" "$ch" ;;
+                REDIRECT) printf 'iptables|%s|%s|%s|redirect|%s|nat|%s\n' "$p" "$lp" "$dest" "$own" "$ch" ;;
+            esac
+        done < <(iptq -t nat -S "$ch" 2>/dev/null)
+    done
+}
+
+located_nft() {
+    nft -a list ruleset 2>/dev/null | awk -v own_tbl="$NFT_TABLE" '
+        /^table / {
+            fam = $2; tbl = $3
+            sub(/[ \t]*\{.*$/, "", tbl)
+            chain = ""
+            next
+        }
+        /^[ \t]+chain / {
+            chain = $2
+            sub(/[ \t]*\{.*$/, "", chain)
+            next
+        }
+        {
+            if (fam == "" || tbl == "" || chain == "") next
+            h = ""
+            if ($(NF-2) == "#" && $(NF-1) == "handle" && $NF ~ /^[0-9]+$/) h = $NF
+            kind = ""; dest = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i != "dport") continue
+                proto = $(i-1); lport = $(i+1)
+                if (proto !~ /^(tcp|udp|sctp|dccp)$/) continue
+                if (lport !~ /^[0-9]+$/) continue
+                for (j = i + 2; j <= NF; j++) {
+                    if ($j == "dnat" && $(j+1) == "to" && $(j+2) != "")     { dest = $(j+2); kind = "dnat";     break }
+                    if ($j == "redirect" && $(j+1) == "to" && $(j+2) != "") { dest = $(j+2); kind = "redirect"; break }
+                }
+                if (kind != "") break
+            }
+            if (kind == "") next
+            own = 0
+            if (tbl == own_tbl) own = 1
+            else if (index($0, "comment \"forward\"") > 0) own = 1
+            printf "nft|%s|%s|%s|%s|%d|%s|%s|%s|%s\n", proto, lport, dest, kind, own, fam, tbl, chain, h
+            next
+        }
+    '
+}
+
+located_fw() {
+    local zone line rest lp proto tp ta dest kind own
+    zone=$(fw_zone)
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in port=*) ;; *) continue ;; esac
+        rest="${line#port=}"
+        case "$rest" in *:proto=*) ;; *) continue ;; esac
+        lp="${rest%%:proto=*}"
+        rest="${rest#*:proto=}"
+        proto="${rest%%:*}"
+        case "$rest" in *:toport=*) ;; *) continue ;; esac
+        rest="${rest#*:toport=}"
+        tp="${rest%%:*}"
+        ta=""
+        case "$rest" in *:toaddr=*) ta="${rest#*:toaddr=}" ;; esac
+        if [ -n "$ta" ]; then
+            dest="$ta:$tp"; kind="dnat"
+        else
+            dest=":$tp";    kind="redirect"
+        fi
+        case "$lp" in ''|*[!0-9]*) continue ;; esac
+        case "$tp" in ''|*[!0-9]*) continue ;; esac
+        own=0
+        if [ "$kind" = dnat ]; then
+            rule_in_conf "$proto" "$lp" "$ta" "$tp" && own=1
+        else
+            rule_in_conf "$proto" "$lp" "127.0.0.1" "$tp" && own=1
+        fi
+        printf 'firewalld|%s|%s|%s|%s|%d|%s\n' "$proto" "$lp" "$dest" "$kind" "$own" "$line"
+    done < <(firewall-cmd --zone="$zone" --list-forward-ports 2>/dev/null)
+}
+
+LOCATED_CACHE=""
+LOCATED_DONE=0
+invalidate_rules_cache() {
+    RULES_ANY_CACHE=""; RULES_ANY_DONE=0
+    LOCATED_CACHE="";   LOCATED_DONE=0
+}
+
+installed_located() {
+    if [ "$LOCATED_DONE" = 1 ]; then
+        [ -n "$LOCATED_CACHE" ] && printf '%s\n' "$LOCATED_CACHE"
+        return 0
+    fi
+    LOCATED_CACHE=$(
+        {
+            if ipt_usable; then located_ipt; fi
+            if cmd_exists nft; then located_nft; fi
+            if firewalld_running; then located_fw; fi
+        } | awk -F'|' 'NF >= 7'
+    )
+    LOCATED_DONE=1
+    [ -n "$LOCATED_CACHE" ] && printf '%s\n' "$LOCATED_CACHE"
+    return 0
+}
+
 # 扫描所有可用后端, 输出 <backend> <proto> <lport> <dest> <kind>
 # 目的: 规则可能不是当前后端写的(切过后端 / 别的工具写的 / 旧版本留下的),
 #       只看当前后端就会"明明有规则却识别不到"。
-# 结果缓存在 RULES_ANY_CACHE 里: 列表/测试会对每条规则调一次, 不缓存的话
-# 在规则多的机器上会反复扫 nft list ruleset(可能几百毫秒一次)。
 RULES_ANY_CACHE=""
 RULES_ANY_DONE=0
-invalidate_rules_cache() { RULES_ANY_CACHE=""; RULES_ANY_DONE=0; }
 installed_rules_any() {
-    if [ "$RULES_ANY_DONE" = 1 ]; then
-        [ -n "$RULES_ANY_CACHE" ] && printf '%s\n' "$RULES_ANY_CACHE"
-        return 0
-    fi
-    RULES_ANY_CACHE=$({
-        if ipt_usable; then installed_rules_ipt | sed 's/^/iptables /'; fi
-        if cmd_exists nft; then installed_rules_nft | sed 's/^/nft /'; fi
-        if firewalld_running; then installed_rules_fw | sed 's/^/firewalld /'; fi
-    } | awk 'NF == 5 && !seen[$2" "$3" "$4" "$5]++')
-    RULES_ANY_DONE=1
-    [ -n "$RULES_ANY_CACHE" ] && printf '%s\n' "$RULES_ANY_CACHE"
-    return 0
+    installed_located | awk -F'|' '
+        NF >= 7 && !seen[$2" "$3" "$4" "$5]++ { printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5 }'
+}
+
+# 删掉一条枚举出来的规则(own=0 的也能删, 供"连别人的规则一起清"用)
+delete_located() {   # backend proto lport dest kind locator
+    local bk="$1" p="$2" lp="$3" dest="$4" kind="$5" loc="$6"
+    local tbl ch line n=0 guard=0 fam h
+    case "$bk" in
+        iptables)
+            tbl="${loc%%|*}"; ch="${loc##*|}"
+            while [ "$guard" -lt 500 ]; do
+                guard=$((guard + 1))
+                line=$(ipt_find_rule "$tbl" "$ch" "$p" "$lp" "$kind" "$dest")
+                [ -z "$line" ] && break
+                split_argv "$line"
+                iptm -t "$tbl" -D "$ch" "${SPLIT_ARGV[@]:2}" || break
+                n=$((n + 1))
+            done
+            [ "$n" -gt 0 ] && return 0
+            return 1
+            ;;
+        nft)
+            fam="${loc%%|*}"; loc="${loc#*|}"
+            tbl="${loc%%|*}"; loc="${loc#*|}"
+            ch="${loc%%|*}";  h="${loc##*|}"
+            [ -n "$fam" ] && [ -n "$tbl" ] && [ -n "$ch" ] && [ -n "$h" ] || return 1
+            nftm delete rule "$fam" "$tbl" "$ch" handle "$h" 2>/dev/null || return 1
+            return 0
+            ;;
+        firewalld)
+            fw_perm --permanent --remove-forward-port="$loc" || return 1
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# 在 iptables 某条链里按条件找第一条匹配的 -A 行(用于精确删除)
+ipt_find_rule() {   # table chain proto lport kind dest
+    local tbl="$1" ch="$2" p="$3" lp="$4" kind="$5" dest="$6"
+    iptq -t "$tbl" -S "$ch" 2>/dev/null | awk -v ch="$ch" -v p="$p" -v lp="$lp" -v k="$kind" -v d="$dest" '
+        $1 != "-A" || $2 != ch { next }
+        {
+            mp = ""; ml = ""; mk = ""; md = "";
+            for (i = 3; i <= NF; i++) {
+                if ($i == "-p" || $i == "--protocol")   mp = $(i+1);
+                else if ($i == "--dport" || $i == "--destination-port") ml = $(i+1);
+                else if ($i == "-j" || $i == "--jump")  mk = $(i+1);
+                else if ($i == "--to-destination")      md = $(i+1);
+                else if ($i == "--to-ports")            md = ":" $(i+1);
+            }
+            if (mp != p || ml != lp || md != d) next;
+            if (k == "dnat" && mk != "DNAT") next;
+            if (k == "redirect" && mk != "REDIRECT") next;
+            print; exit
+        }'
 }
 
 # 配置里是否有这条(供"仅内核"标记使用); $4 可以是 * 表示任意目标端口
@@ -1603,14 +1880,17 @@ port_open() {    local h="$1" pt="$2" pr="${3:-tcp}" have_nc_z=0
 }
 
 do_test() {
-    local only="${1:-}" p lp dip dp m mode tgt tport found=0 fail=0
-    if [ "$(count_rules)" -eq 0 ]; then
-        info "当前没有规则可测试"
-        return 0
-    fi
+    local only="${1:-}" p lp dip dp m mode tgt tport found=0 fail=0 nconf=0
     need_root
     invalidate_rules_cache
     resolve_backend >/dev/null 2>&1 || true
+
+    nconf=$(count_rules)
+    if [ "$nconf" -eq 0 ]; then
+        info "配置文件里没有规则, 只测试内核里扫描到的规则"
+    fi
+
+    # 1) 配置里的规则
     while read -r p lp dip dp m; do
         if [ -n "$only" ] && [ "$only" != "$lp" ]; then
             continue
@@ -1618,7 +1898,7 @@ do_test() {
         found=1
         mode=$(rule_mode "$dip")
         log "----------------------------------------------"
-        log "规则: ${p} ${lp} -> ${dip}:${dp}  (${mode})"
+        log "规则: ${p} ${lp} -> ${dip}:${dp}  (${mode}, 来自配置)"
         if check_rule_installed "$p" "$lp" "$dip" "$dp"; then
             ok "防火墙规则已安装"
         else
@@ -1637,7 +1917,43 @@ do_test() {
             *) warn "目标 ${tgt}:${tport}/${p} 连接失败(服务未启动或被防火墙拦截)"; fail=1 ;;
         esac
     done < <(norm_rules)
-    [ "$found" = 0 ] && { warn "没有找到监听端口为 ${only} 的规则"; fail=1; }
+
+    # 2) 内核里有、但配置里没有的规则(手工加的 / 别的工具加的 / 旧版本残留)
+    local bk dest kind own loc kdip kdp
+    while IFS='|' read -r bk p lp dest kind own loc; do
+        [ -z "${bk:-}" ] && continue
+        case "$dest" in
+            *:*) kdip="${dest%:*}"; kdp="${dest##*:}" ;;
+            *)   kdip="$dest";      kdp="$lp" ;;
+        esac
+        [ -z "$kdip" ] && kdip="127.0.0.1"
+        [ "$kind" = redirect ] && kdip="127.0.0.1"
+        rule_in_conf "$p" "$lp" "$kdip" "$kdp" && continue
+        if [ -n "$only" ] && [ "$only" != "$lp" ]; then
+            continue
+        fi
+        found=1
+        log "----------------------------------------------"
+        if [ "$own" = 1 ]; then
+            log "规则: ${p} ${lp} -> ${kdip}:${kdp}  (来自 $bk, 不在配置文件中)"
+        else
+            log "规则: ${p} ${lp} -> ${kdip}:${kdp}  (来自 $bk, 不是本工具写入的)"
+        fi
+        ok "防火墙里确实有这条规则"
+        if [ "$kind" = redirect ] || [ "$kdip" = "127.0.0.1" ]; then
+            tgt="127.0.0.1"; tport="$kdp"
+        else
+            tgt="$kdip"; tport="$kdp"
+        fi
+        port_open "$tgt" "$tport" "$p"
+        case $? in
+            0) ok "目标 ${tgt}:${tport}/${p} 可连接" ;;
+            2) info "UDP 无法可靠探测, 请用实际业务验证" ;;
+            *) warn "目标 ${tgt}:${tport}/${p} 连接失败(服务未启动或被防火墙拦截)"; fail=1 ;;
+        esac
+    done < <(installed_located)
+
+    [ "$found" = 0 ] && { warn "没有找到监听端口为 ${only} 的规则(配置和内核里都没有)"; fail=1; }
     log "----------------------------------------------"
     info "提示: 在转发主机上用 127.0.0.1:${only:-<入口端口>} 测试不会经过 PREROUTING,"
     info "      DNAT 必须从其它机器发起才有效(本机测试请用目标端口)."
@@ -2110,19 +2426,19 @@ main_menu() {
         printf '  %s=== 端口转发管理 %sv%s%s ===%s\n' "$C_BLU" "$C_DIM" "$VERSION" "$C_BLU" "$C_RST"
         printf '  后端: %s\n' "$(current_backend || echo '未探测到')"
         printf '  规则: %s 条\n' "$(count_rules)"
+        printf '  自启: %s\n' "$(persist_enabled && echo '已启用(重启自动恢复)' || echo '未启用')"
         printf '  ------------------------------------------------\n'
         printf '   1) 查看状态\n'
         printf '   2) 添加转发规则\n'
         printf '   3) 删除转发规则\n'
         printf '   4) 查看规则列表\n'
         printf '   5) 测试转发\n'
-        printf '   6) 应用规则(立即生效)\n'
-        printf '   7) 开机自启 (装入/卸载)\n'
-        printf '   8) 清空所有规则\n'
-        printf '   9) 切换转发后端\n'
+        printf '   6) 开机自启 / 卸载\n'
+        printf '   7) 清空转发规则\n'
+        printf '   8) 切换转发后端\n'
         printf '   0) 退出\n'
         printf '  ------------------------------------------------\n'
-        if ! read -r -p "  请选择 [0-9]: " choice; then
+        if ! read -r -p "  请选择 [0-8]: " choice; then
             printf '\n'
             exit 0
         fi
@@ -2132,20 +2448,20 @@ main_menu() {
             3) menu_del ;;
             4) do_list ;;
             5) do_test ;;
-            6) do_apply ;;
-            7)
+            6)
                 if persist_enabled; then
-                    if confirm "开机自启已启用, 是否卸载? [y/N] "; then
-                        persist_remove
-                    else
-                        do_apply
+                    info "开机自启已启用: 重启后自动恢复规则, 输入 $PROG 打开本面板"
+                    if confirm "是否卸载开机自启(转发规则保留)? [y/N] "; then
+                        if persist_remove; then
+                            ok "已卸载开机自启; 当前转发规则仍然生效(重启后不再自动恢复)"
+                        fi
                     fi
                 else
-                    persist_install && do_apply
+                    persist_install && do_apply && ok "已装入开机自启; 以后输入 $PROG 即可打开本面板"
                 fi
                 ;;
-            8) do_clear ;;
-            9) menu_backend ;;
+            7) do_clear ;;
+            8) menu_backend ;;
             0|q|Q) printf '\n'; exit 0 ;;
             *) ;;
         esac
@@ -2170,14 +2486,14 @@ ${PROG} ${VERSION} - Linux 端口转发管理工具 (iptables / nftables / firew
   del        删除转发规则        del 8080 [-p tcp]
   list       列出规则            list [--raw]
   apply      应用规则(立即生效)  apply
-  clear      清空所有规则        clear [--yes]
+  clear      清空转发规则        clear [--yes] [--all]
   test       测试转发            test [监听端口]
   status     查看运行状态        status [--raw]
   backend    查看/切换后端       backend [auto|iptables|nft|firewalld]
   doctor     诊断: 打印后端原始规则(规则"识别不到"时用)
   import     收编内核里已有、但配置里没有的规则到 rules.conf
   install    安装开机自启        install
-  uninstall  卸载(自启+程序+规则) uninstall [--keep-rules] [--purge]
+  uninstall  卸载(自启+程序, 规则保留) uninstall [--clear-rules] [--purge]
   menu       交互菜单
 
 选项:
@@ -2192,7 +2508,8 @@ ${PROG} ${VERSION} - Linux 端口转发管理工具 (iptables / nftables / firew
   -y, --yes                所有确认自动回答 yes
   -n, --dry-run            只打印将执行的命令, 不改动系统
       --raw                机器可读输出
-      --keep-rules         卸载时保留已下发的规则(默认会清理)
+      --all                clear 时连不是本工具写入的规则一起清
+      --clear-rules        uninstall 时连已下发的规则一起清(默认保留)
       --purge              卸载时连配置目录一起删除
       --no-color           禁用颜色
   -h, --help               显示帮助
@@ -2310,11 +2627,11 @@ cmd_uninstall() {
     if [ "$ASSUME_YES" != 1 ] && [ -t 0 ]; then
         log "将要执行:"
         log "  1) 移除开机自启 ($init)"
-        log "  2) 删除程序本体 $SELF_BIN"
-        if [ "$OPT_KEEP_RULES" = 1 ]; then
-            log "  3) 保留已下发的转发规则 (--keep-rules), 但重启后不会再恢复"
+        log "  2) 删除程序本体 $SELF_BIN (面板与命令都没了)"
+        if [ "$OPT_CLEAR_RULES" = 1 ]; then
+            log "  3) 清理已下发的转发规则 (--clear-rules)"
         else
-            log "  3) 清理已下发的转发规则"
+            log "  3) 保留已下发的转发规则 (当前转发不受影响)"
         fi
         if [ "$OPT_PURGE" = 1 ]; then
             log "  4) 删除配置目录 $CONF_DIR"
@@ -2329,7 +2646,7 @@ cmd_uninstall() {
 
     persist_remove || warn "移除开机自启时出错, 继续"
 
-    if [ "$OPT_KEEP_RULES" != 1 ]; then
+    if [ "$OPT_CLEAR_RULES" = 1 ]; then
         if clear_firewall_rules; then
             if [ "$CLEAR_SKIPPED" = 1 ]; then
                 rule_state="未清理(没有可用的防火墙后端)"
@@ -2340,7 +2657,7 @@ cmd_uninstall() {
             rule_state="清理出错, 请用 list 核对"
         fi
     else
-        rule_state="保留(重启后不再自动恢复)"
+        rule_state="保留(当前转发继续工作; 重启后不会自动恢复)"
     fi
 
     # 即使当前正运行的就是 $SELF_BIN, Linux 也允许 unlink 正在执行的脚本文件
@@ -2400,7 +2717,8 @@ cmd_uninstall() {
     if [ "$OPT_PURGE" != 1 ] && [ -f "$RULES_FILE" ]; then
         log ""
         log "  注意: 开机自启已移除, 重启后规则不会自动恢复(内核规则本身不跨重启)。"
-        log "        需要再次使用时, 用原脚本重新安装: sudo bash forward.sh install"
+        log "        当前正在转发的流量不受影响; 需要再次使用时, 用原脚本重新安装:"
+        log "        sudo bash forward.sh install"
     fi
     return 0
 }
@@ -2421,7 +2739,9 @@ parse_args() {
             --raw)        RAW=1 ;;
             --no-color)   NO_COLOR_OPT=1 ;;
             --masq)       OPT_MASQ=1 ;;
-            --keep-rules) OPT_KEEP_RULES=1 ;;
+            --keep-rules) OPT_CLEAR_RULES=0 ;;   # 兼容旧参数: 卸载默认就保留规则
+            --clear-rules) OPT_CLEAR_RULES=1 ;;
+            --all)        OPT_ALL=1 ;;
             --purge)      OPT_PURGE=1 ;;
             --backend)    shift; OPT_BACKEND="${1:-}"; [ -n "$OPT_BACKEND" ] || die "--backend 需要参数" ;;
             --backend=*)  OPT_BACKEND="${arg#*=}" ;;
