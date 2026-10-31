@@ -17,6 +17,9 @@
 #
 #  说明: 规则保存在 /etc/forward/rules.conf, 该文件是唯一事实来源,
 #        apply 会按文件内容重建防火墙规则(只动自己的规则, 不碰 Docker/ufw)。
+#
+#  __FORWARD_TOOL__  本行是卸载时的身份标识: uninstall 会删除 PATH 中所有
+#                    带此标识的 forward 副本, 避免"卸载后 forward 还能用"。
 #===============================================================================
 
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -30,7 +33,7 @@ set -u
 # 常量与全局变量
 #-------------------------------------------------------------------------------
 readonly PROG="forward"
-readonly VERSION="3.1.0"
+readonly VERSION="3.1.1"
 
 # 所有路径都可用环境变量覆盖, 便于测试/容器内使用
 readonly CONF_DIR="${FORWARD_CONF_DIR:-/etc/forward}"
@@ -516,10 +519,12 @@ ipt_sweep_chain() {
 }
 
 ipt_sweep() {
-    ipt_sweep_chain nat PREROUTING
-    ipt_sweep_chain nat POSTROUTING
-    ipt_sweep_chain filter FORWARD
-    ipt_sweep_chain filter INPUT
+    local t=0
+    ipt_sweep_chain nat PREROUTING;      t=$((t + SWEPT_COUNT))
+    ipt_sweep_chain nat POSTROUTING;     t=$((t + SWEPT_COUNT))
+    ipt_sweep_chain filter FORWARD;      t=$((t + SWEPT_COUNT))
+    ipt_sweep_chain filter INPUT;        t=$((t + SWEPT_COUNT))
+    SWEPT_COUNT=$t
 }
 
 # 为一条规则生成 iptables 规则(适用于 apply / clear 两个方向)
@@ -1197,8 +1202,8 @@ legacy_migrate() {
 cleanup_other_backends() {
     local want="$1"
     if [ "$want" != iptables ] && [ -s "$APPLIED_FILE" ] && cmd_exists iptables; then
-        if ipt_clear >/dev/null 2>&1; then
-            info "已清理 iptables 后端留下的规则"
+        if ipt_clear >/dev/null 2>&1 && [ "${SWEPT_COUNT:-0}" -gt 0 ]; then
+            info "已清理 iptables 后端留下的 ${SWEPT_COUNT} 条规则"
         fi
     fi
     if [ "$want" != nft ] && cmd_exists nft; then
@@ -2041,6 +2046,40 @@ self_path() {
     printf '%s' "$p"
 }
 
+# 本工具的身份标识(写在文件头), 用来在 PATH 里认出自己的副本
+TOOL_MARKER="__FORWARD_TOOL__"
+
+# 判断某个文件是不是本工具的副本(含更早的、没有标识行的版本)
+is_our_tool() {   # $1=路径
+    [ -f "$1" ] || return 1
+    grep -q -- "$TOOL_MARKER" "$1" 2>/dev/null && return 0
+    # 兼容更早的版本(没有标识行, 甚至还是 portfwd 时期的表名): 同时命中 3 个特征才认
+    grep -qm1 '^readonly PROG="forward"' "$1" 2>/dev/null || return 1
+    grep -qm1 'RULES_FILE="$CONF_DIR/rules.conf"' "$1" 2>/dev/null || return 1
+    grep -qm1 '^readonly NFT_TABLE=' "$1" 2>/dev/null || return 1
+    return 0
+}
+
+# 列出 PATH 中所有本工具的副本(含 /usr/local/sbin 等标准目录)
+# 只认本工具的文件, 不会误删别的同名程序
+tool_copies() {   # 输出: 每行一个绝对路径
+    local d f seen="|"
+    for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin \
+             $(printf '%s' "${PATH:-}" | tr ':' ' '); do
+        [ -n "$d" ] || continue
+        f="$d/forward"
+        case "$seen" in *"|$f|"*) continue ;; esac
+        seen="$seen$f|"
+        is_our_tool "$f" && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+# 读取某个副本里声明的版本号
+tool_version_of() {   # $1=路径
+    sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
 persist_enabled() {
     local init
     init=$(init_system)
@@ -2172,6 +2211,20 @@ persist_install() {
     fi
     # 2) ip_forward 持久化
     [ "$DRY_RUN" = 1 ] || persist_ip_forward
+    # 2.5) 清掉 PATH 里其它位置的本工具副本, 否则 'forward' 可能仍指向旧版本
+    if [ "$DRY_RUN" != 1 ]; then
+        local dup
+        while IFS= read -r dup; do
+            [ -n "$dup" ] || continue
+            [ "$dup" = "$SELF_BIN" ] && continue
+            if rm -f -- "$dup" 2>/dev/null; then
+                info "已移除重复副本 $dup (避免它抢先于 $SELF_BIN)"
+            fi
+        done <<EOF2
+$(tool_copies)
+EOF2
+        hash -r 2>/dev/null || true
+    fi
     # 3) 自启
     init=$(init_system)
     case "$init" in
@@ -2215,6 +2268,11 @@ persist_install() {
             ;;
     esac
     ok "开机自启已安装 ($init)"
+    if [ "$(command -v "$PROG" 2>/dev/null)" != "$SELF_BIN" ]; then
+        if [ "$DRY_RUN" != 1 ]; then
+            warn "PATH 中启动不到 $SELF_BIN, 直接输入 $PROG 可能无效; 请确认 /usr/local/sbin 在 PATH 中"
+        fi
+    fi
     return 0
 }
 
@@ -2661,12 +2719,14 @@ cmd_uninstall() {
     fi
 
     # 即使当前正运行的就是 $SELF_BIN, Linux 也允许 unlink 正在执行的脚本文件
+    local removed=0 skipped=""
     if [ -e "$SELF_BIN" ] || [ -h "$SELF_BIN" ]; then
         if [ "$DRY_RUN" = 1 ]; then
             printf '  [dry-run] rm -f %s\n' "$SELF_BIN"
             bin_state="(dry-run 未删除)"
         elif rm -f -- "$SELF_BIN" 2>/dev/null; then
             info "已删除程序本体 $SELF_BIN"
+            removed=$((removed + 1))
             bin_state="已删除"
         else
             warn "删除 $SELF_BIN 失败(权限不足?)"
@@ -2675,6 +2735,27 @@ cmd_uninstall() {
     else
         bin_state="不存在"
     fi
+
+    # 再清掉 PATH 里其它位置的副本(手工拷到 /usr/local/bin 等), 否则"卸载了还能用"
+    local cp
+    while IFS= read -r cp; do
+        [ -n "$cp" ] || continue
+        [ "$cp" = "$SELF_BIN" ] && continue
+        if [ "$DRY_RUN" = 1 ]; then
+            printf '  [dry-run] rm -f %s\n' "$cp"
+            continue
+        fi
+        if rm -f -- "$cp" 2>/dev/null; then
+            info "已删除副本 $cp"
+            removed=$((removed + 1))
+        else
+            warn "删除副本 $cp 失败(权限不足?)"
+            skipped="$skipped $cp"
+        fi
+    done <<EOF2
+$(tool_copies)
+EOF2
+    [ "$removed" -gt 0 ] && bin_state="已删除(${removed} 个文件)"
     hash -r 2>/dev/null || true
 
     # PATH 里还有别的同名命令时, 用户会以为"没卸载干净"/"forward 还能用"
@@ -2682,6 +2763,15 @@ cmd_uninstall() {
     if [ -n "$p" ] && [ "$p" != "$SELF_BIN" ] && [ -f "$p" ]; then
         warn "PATH 中还有另一个 forward: $p"
         warn "  它不是本工具安装的(可能是别的软件或手工拷贝), 输入 forward 会启动它; 如不需要请自行删除"
+    elif [ -n "$p" ] && [ ! -f "$p" ]; then
+        # 文件已删, 但本次进程的命令缓存里还留着旧路径(极少见)
+        warn "命令缓存里还留着 $p (文件已删除), 执行 hash -r 即可清掉"
+    elif [ -n "$skipped" ]; then
+        warn "以下副本删除失败:$skipped"
+    fi
+    # 别名/函数也可能让 forward 继续可用
+    if cmd_exists alias 2>/dev/null && alias forward >/dev/null 2>&1; then
+        warn "当前 shell 里有 alias forward, 请执行 unalias forward 或重开终端"
     fi
 
     if [ "$OPT_PURGE" = 1 ]; then
@@ -2719,6 +2809,9 @@ cmd_uninstall() {
         log "  注意: 开机自启已移除, 重启后规则不会自动恢复(内核规则本身不跨重启)。"
         log "        当前正在转发的流量不受影响; 需要再次使用时, 用原脚本重新安装:"
         log "        sudo bash forward.sh install"
+    fi
+    if [ "$removed" -gt 0 ]; then
+        log "  提示: 如果当前终端里输入 forward 还有反应, 执行 hash -r 或重开终端即可。"
     fi
     return 0
 }
@@ -2765,6 +2858,18 @@ parse_args() {
     return 0
 }
 
+warn_stale_install() {
+    [ "$DRY_RUN" = 1 ] && return 0
+    [ -f "$SELF_BIN" ] || return 0
+    local me iv
+    me=$(self_path)
+    [ "$me" = "$SELF_BIN" ] && return 0
+    cmp -s "$me" "$SELF_BIN" 2>/dev/null && return 0
+    iv=$(tool_version_of "$SELF_BIN")
+    warn "注意: $SELF_BIN 里装的是另一个版本 (${iv:-未知} / 当前 ${VERSION})"
+    warn "      直接输入 $PROG 运行的是那一份; 执行 'sudo $PROG install' 可覆盖为当前版本"
+}
+
 main() {
     parse_args "$@"
     init_colors
@@ -2772,6 +2877,11 @@ main() {
     if [ "${#POSITIONAL[@]}" -gt 0 ]; then
         cmd="${POSITIONAL[0]}"
     fi
+
+    case "$cmd" in
+        ""|menu|add|del|delete|list|ls|clear|flush|test|status|info|doctor|diag|import|adopt)
+            warn_stale_install ;;
+    esac
 
     if [ -z "$cmd" ]; then
         if [ ! -t 0 ]; then
